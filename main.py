@@ -117,6 +117,7 @@ def _get_user_env(user_name: str, user_uid: int, user_home: str) -> Dict[str, st
 class Plugin:
     def __init__(self):
         self._lock = asyncio.Lock()
+        self._scan_lock = asyncio.Lock()
         self._user_name, self._user_uid, self._user_gid, self._user_home = _get_decky_user_info()
         self._hoard_bin = os.path.join(self._user_home, ".local", "bin", "hoard")
         self._cached_games: Optional[Dict[str, Any]] = None
@@ -289,35 +290,41 @@ class Plugin:
             temp_dir = tempfile.mkdtemp(prefix="decky_hoard_install_")
             installer_path = os.path.join(temp_dir, "HoardSetup")
             try:
-                logger.info(f"Downloading HoardSetup from {installer_url}...")
-                req = urllib.request.Request(installer_url, headers={"User-Agent": "decky-hoard"})
-                with urllib.request.urlopen(req, timeout=120) as resp, open(installer_path, "wb") as f:
-                    shutil.copyfileobj(resp, f)
+                def _download_and_verify() -> Optional[Dict[str, Any]]:
+                    logger.info(f"Downloading HoardSetup from {installer_url}...")
+                    req = urllib.request.Request(installer_url, headers={"User-Agent": "decky-hoard"})
+                    with urllib.request.urlopen(req, timeout=120) as resp, open(installer_path, "wb") as f:
+                        shutil.copyfileobj(resp, f)
 
-                # Fetch expected checksum
-                expected_sha256 = None
-                try:
-                    chk_req = urllib.request.Request(checksum_url, headers={"User-Agent": "decky-hoard"})
-                    with urllib.request.urlopen(chk_req, timeout=30) as resp:
-                        chk_text = resp.read().decode("utf-8").strip()
-                        expected_sha256 = chk_text.split()[0]
-                except Exception as e:
-                    logger.warning(f"Failed to fetch .sha256 checksum file: {e}")
+                    # Fetch expected checksum
+                    expected_sha256 = None
+                    try:
+                        chk_req = urllib.request.Request(checksum_url, headers={"User-Agent": "decky-hoard"})
+                        with urllib.request.urlopen(chk_req, timeout=30) as resp:
+                            chk_text = resp.read().decode("utf-8").strip()
+                            expected_sha256 = chk_text.split()[0]
+                    except Exception as e:
+                        logger.warning(f"Failed to fetch .sha256 checksum file: {e}")
 
-                # Verify checksum if available
-                if expected_sha256:
-                    hasher = hashlib.sha256()
-                    with open(installer_path, "rb") as f:
-                        while chunk := f.read(65536):
-                            hasher.update(chunk)
-                    actual_sha256 = hasher.hexdigest()
-                    if actual_sha256.lower() != expected_sha256.lower():
-                        return {
-                            "ok": False,
-                            "error": "checksum_mismatch",
-                            "message": f"SHA256 mismatch! Expected {expected_sha256}, got {actual_sha256}",
-                        }
-                    logger.info("HoardSetup checksum verified successfully.")
+                    # Verify checksum if available
+                    if expected_sha256:
+                        hasher = hashlib.sha256()
+                        with open(installer_path, "rb") as f:
+                            while chunk := f.read(65536):
+                                hasher.update(chunk)
+                        actual_sha256 = hasher.hexdigest()
+                        if actual_sha256.lower() != expected_sha256.lower():
+                            return {
+                                "ok": False,
+                                "error": "checksum_mismatch",
+                                "message": f"SHA256 mismatch! Expected {expected_sha256}, got {actual_sha256}",
+                            }
+                        logger.info("HoardSetup checksum verified successfully.")
+                    return None
+
+                verify_err = await asyncio.to_thread(_download_and_verify)
+                if verify_err:
+                    return verify_err
 
                 # Make executable and transfer ownership
                 os.chmod(installer_path, 0o755)
@@ -562,128 +569,129 @@ class Plugin:
            - tracked
            - missing_folder
         """
-        if self._cached_games and not force_refresh:
-            return self._cached_games
+        async with self._scan_lock:
+            if self._cached_games and not force_refresh:
+                return self._cached_games
 
-        self._is_scanning = True
-        try:
-            # 1. Parse Steam manifests
-            steam_games = self._scan_steam_installed_games()
+            self._is_scanning = True
+            try:
+                # 1. Parse Steam manifests
+                steam_games = self._scan_steam_installed_games()
 
-            # 2. Query hoard saves (tracked saves)
-            tracked_slugs: set = set()
-            tracked_names: set = set()
-            saves_res = await self._run_hoard("saves", "--json", timeout=20)
-            if saves_res["ok"] and saves_res.get("data"):
-                saves_list = saves_res["data"].get("data", {}).get("saves", [])
-                for s in saves_list:
-                    if s.get("slug"):
-                        tracked_slugs.add(s["slug"].lower())
-                    if s.get("game_name"):
-                        tracked_names.add(_normalize_name(s["game_name"]))
+                # 2. Query hoard saves (tracked saves)
+                tracked_slugs: set = set()
+                tracked_names: set = set()
+                saves_res = await self._run_hoard("saves", "--json", timeout=20)
+                if saves_res["ok"] and saves_res.get("data"):
+                    saves_list = saves_res["data"].get("data", {}).get("saves", [])
+                    for s in saves_list:
+                        if s.get("slug"):
+                            tracked_slugs.add(s["slug"].lower())
+                        if s.get("game_name"):
+                            tracked_names.add(_normalize_name(s["game_name"]))
 
-            # 3. Query hoard scan --json
-            scan_games_map: Dict[str, Dict[str, Any]] = {}
-            scan_res = await self._run_hoard("scan", "--json", timeout=180)
-            if scan_res["ok"] and scan_res.get("data"):
-                scanned_list = scan_res["data"].get("data", {}).get("games", [])
-                for sg in scanned_list:
-                    slug = sg.get("slug", "")
-                    disp_name = sg.get("display_name", "")
-                    norm = _normalize_name(disp_name or slug)
-                    scan_games_map[norm] = sg
+                # 3. Query hoard scan --json
+                scan_games_map: Dict[str, Dict[str, Any]] = {}
+                scan_res = await self._run_hoard("scan", "--json", timeout=180)
+                if scan_res["ok"] and scan_res.get("data"):
+                    scanned_list = scan_res["data"].get("data", {}).get("games", [])
+                    for sg in scanned_list:
+                        slug = sg.get("slug", "")
+                        disp_name = sg.get("display_name", "")
+                        norm = _normalize_name(disp_name or slug)
+                        scan_games_map[norm] = sg
+                        if slug:
+                            scan_games_map[slug.lower()] = sg
+
+                ready_to_track: List[Dict[str, Any]] = []
+                other_games: List[Dict[str, Any]] = []
+                tracked: List[Dict[str, Any]] = []
+                missing_folder: List[Dict[str, Any]] = []
+
+                seen_tracked_slugs: set = set()
+
+                for sg in steam_games:
+                    name = sg["name"]
+                    appid = sg["appid"]
+                    norm = _normalize_name(name)
+
+                    # Match with scan entry
+                    scan_entry = scan_games_map.get(norm)
+
+                    is_tracked = False
+                    slug = None
+                    needs_folder = False
+                    paths = []
+
+                    if scan_entry:
+                        slug = scan_entry.get("slug")
+                        is_tracked = bool(scan_entry.get("tracked"))
+                        needs_folder = bool(scan_entry.get("needs_folder"))
+                        paths = scan_entry.get("paths", [])
+
+                    if not is_tracked:
+                        if (slug and slug.lower() in tracked_slugs) or norm in tracked_names:
+                            is_tracked = True
+
+                    item = {
+                        "name": name,
+                        "appid": appid,
+                        "slug": slug,
+                        "needs_folder": needs_folder,
+                        "paths": paths,
+                        "tracked": is_tracked,
+                    }
+
                     if slug:
-                        scan_games_map[slug.lower()] = sg
+                        seen_tracked_slugs.add(slug.lower())
 
-            ready_to_track: List[Dict[str, Any]] = []
-            other_games: List[Dict[str, Any]] = []
-            tracked: List[Dict[str, Any]] = []
-            missing_folder: List[Dict[str, Any]] = []
+                    if is_tracked:
+                        tracked.append(item)
+                    elif needs_folder:
+                        missing_folder.append(item)
+                    elif scan_entry:
+                        ready_to_track.append(item)
+                    else:
+                        other_games.append(item)
 
-            seen_tracked_slugs: set = set()
+                # Include any scanned games that are already tracked but weren't in Steam manifests (e.g. GOG, Epic, emulators)
+                for norm, sg in scan_games_map.items():
+                    slug = sg.get("slug")
+                    if not slug or slug.lower() in seen_tracked_slugs:
+                        continue
+                    is_tracked = bool(sg.get("tracked")) or (slug.lower() in tracked_slugs)
+                    if is_tracked:
+                        seen_tracked_slugs.add(slug.lower())
+                        tracked.append({
+                            "name": sg.get("display_name", slug),
+                            "appid": None,
+                            "slug": slug,
+                            "needs_folder": bool(sg.get("needs_folder")),
+                            "paths": sg.get("paths", []),
+                            "tracked": True,
+                        })
 
-            for sg in steam_games:
-                name = sg["name"]
-                appid = sg["appid"]
-                norm = _normalize_name(name)
+                # Sort alphabetically within each category
+                ready_to_track.sort(key=lambda x: x["name"].lower())
+                other_games.sort(key=lambda x: x["name"].lower())
+                tracked.sort(key=lambda x: x["name"].lower())
+                missing_folder.sort(key=lambda x: x["name"].lower())
 
-                # Match with scan entry
-                scan_entry = scan_games_map.get(norm)
-
-                is_tracked = False
-                slug = None
-                needs_folder = False
-                paths = []
-
-                if scan_entry:
-                    slug = scan_entry.get("slug")
-                    is_tracked = bool(scan_entry.get("tracked"))
-                    needs_folder = bool(scan_entry.get("needs_folder"))
-                    paths = scan_entry.get("paths", [])
-
-                if not is_tracked:
-                    if (slug and slug.lower() in tracked_slugs) or norm in tracked_names:
-                        is_tracked = True
-
-                item = {
-                    "name": name,
-                    "appid": appid,
-                    "slug": slug,
-                    "needs_folder": needs_folder,
-                    "paths": paths,
-                    "tracked": is_tracked,
+                result = {
+                    "ready_to_track": ready_to_track,
+                    "other_games": other_games,
+                    "tracked": tracked,
+                    "missing_folder": missing_folder,
+                    "summary": {
+                        "total": len(ready_to_track) + len(other_games) + len(tracked) + len(missing_folder),
+                        "ready_count": len(ready_to_track),
+                        "other_count": len(other_games),
+                        "tracked_count": len(tracked),
+                        "missing_count": len(missing_folder),
+                    },
                 }
 
-                if slug:
-                    seen_tracked_slugs.add(slug.lower())
-
-                if is_tracked:
-                    tracked.append(item)
-                elif needs_folder:
-                    missing_folder.append(item)
-                elif scan_entry:
-                    ready_to_track.append(item)
-                else:
-                    other_games.append(item)
-
-            # Include any scanned games that are already tracked but weren't in Steam manifests (e.g. GOG, Epic, emulators)
-            for norm, sg in scan_games_map.items():
-                slug = sg.get("slug")
-                if not slug or slug.lower() in seen_tracked_slugs:
-                    continue
-                is_tracked = bool(sg.get("tracked")) or (slug.lower() in tracked_slugs)
-                if is_tracked:
-                    seen_tracked_slugs.add(slug.lower())
-                    tracked.append({
-                        "name": sg.get("display_name", slug),
-                        "appid": None,
-                        "slug": slug,
-                        "needs_folder": bool(sg.get("needs_folder")),
-                        "paths": sg.get("paths", []),
-                        "tracked": True,
-                    })
-
-            # Sort alphabetically within each category
-            ready_to_track.sort(key=lambda x: x["name"].lower())
-            other_games.sort(key=lambda x: x["name"].lower())
-            tracked.sort(key=lambda x: x["name"].lower())
-            missing_folder.sort(key=lambda x: x["name"].lower())
-
-            result = {
-                "ready_to_track": ready_to_track,
-                "other_games": other_games,
-                "tracked": tracked,
-                "missing_folder": missing_folder,
-                "summary": {
-                    "total": len(ready_to_track) + len(other_games) + len(tracked) + len(missing_folder),
-                    "ready_count": len(ready_to_track),
-                    "other_count": len(other_games),
-                    "tracked_count": len(tracked),
-                    "missing_count": len(missing_folder),
-                },
-            }
-
-            self._cached_games = result
-            return result
-        finally:
-            self._is_scanning = False
+                self._cached_games = result
+                return result
+            finally:
+                self._is_scanning = False

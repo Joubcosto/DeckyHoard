@@ -55,22 +55,23 @@ if [ -n "${REMOTE_HOST}" ]; then
     # -------------------------------------------------------------------------
     log_info "Deploying remotely to: ${REMOTE_HOST}"
 
+    REMOTE_TMP="/tmp/${PLUGIN_NAME}"
     REMOTE_DEST="~/homebrew/plugins/${PLUGIN_NAME}"
 
-    log_info "Creating remote plugin directory..."
-    ssh "${REMOTE_HOST}" "mkdir -p ${REMOTE_DEST}"
+    log_info "Creating temporary directory on remote host..."
+    ssh "${REMOTE_HOST}" "mkdir -p ${REMOTE_TMP}"
 
-    log_info "Syncing plugin files..."
+    log_info "Syncing plugin files to ${REMOTE_TMP}..."
     rsync -avz --delete \
         --exclude 'node_modules' \
         --exclude '.git' \
         --exclude 'src' \
         --exclude 'tsconfig.json' \
         --exclude 'rollup.config.js' \
-        "${PLUGIN_DIR}/" "${REMOTE_HOST}:${REMOTE_DEST}/"
+        "${PLUGIN_DIR}/" "${REMOTE_HOST}:${REMOTE_TMP}/"
 
-    log_info "Restarting plugin_loader service on ${REMOTE_HOST}..."
-    ssh -t "${REMOTE_HOST}" "sudo systemctl restart plugin_loader"
+    log_info "Installing to ${REMOTE_DEST} and restarting plugin_loader on ${REMOTE_HOST}..."
+    ssh -t "${REMOTE_HOST}" "sudo mkdir -p ~/homebrew/plugins && sudo rm -rf ${REMOTE_DEST} && sudo cp -r ${REMOTE_TMP} ~/homebrew/plugins/ && sudo chmod -R 755 ${REMOTE_DEST} && rm -rf ${REMOTE_TMP} && sudo systemctl restart plugin_loader"
 
     log_success "Remote deployment complete! decky-hoard is active on ${REMOTE_HOST}"
 
@@ -82,33 +83,35 @@ else
     HOME_DIR="${HOME:-/home/${LOCAL_USER}}"
     TARGET_DIR="${HOME_DIR}/homebrew/plugins/${PLUGIN_NAME}"
 
+    if [ "${EUID}" -eq 0 ]; then
+        SUDO=""
+    else
+        SUDO="sudo"
+    fi
+
     log_info "Deploying locally to: ${TARGET_DIR}"
 
     if [ ! -d "${HOME_DIR}/homebrew/plugins" ]; then
         log_warn "${HOME_DIR}/homebrew/plugins does not exist. Creating directory..."
-        mkdir -p "${HOME_DIR}/homebrew/plugins"
+        ${SUDO} mkdir -p "${HOME_DIR}/homebrew/plugins"
     fi
 
     # Create target directory
-    mkdir -p "${TARGET_DIR}"
+    ${SUDO} mkdir -p "${TARGET_DIR}"
 
     # Copy files
     log_info "Copying plugin files..."
-    cp -r "${PLUGIN_DIR}/dist" "${TARGET_DIR}/"
-    cp "${PLUGIN_DIR}/main.py" "${TARGET_DIR}/"
-    cp "${PLUGIN_DIR}/plugin.json" "${TARGET_DIR}/"
-    cp "${PLUGIN_DIR}/package.json" "${TARGET_DIR}/"
+    ${SUDO} cp -r "${PLUGIN_DIR}/dist" "${TARGET_DIR}/"
+    ${SUDO} cp "${PLUGIN_DIR}/main.py" "${TARGET_DIR}/"
+    ${SUDO} cp "${PLUGIN_DIR}/plugin.json" "${TARGET_DIR}/"
+    ${SUDO} cp "${PLUGIN_DIR}/package.json" "${TARGET_DIR}/"
 
     # Set appropriate ownership and permissions
-    chmod -R 755 "${TARGET_DIR}"
+    ${SUDO} chmod -R 755 "${TARGET_DIR}"
 
     log_info "Restarting Decky Loader (plugin_loader service)..."
     if command -v systemctl >/dev/null 2>&1; then
-        if [ "${EUID}" -eq 0 ]; then
-            systemctl restart plugin_loader
-        else
-            sudo systemctl restart plugin_loader
-        fi
+        ${SUDO} systemctl restart plugin_loader
         log_success "Plugin deployed and plugin_loader restarted successfully!"
     else
         log_warn "systemctl not found. Please restart Decky Loader manually."

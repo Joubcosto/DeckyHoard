@@ -15,6 +15,7 @@ import {
   PanelSection,
   PanelSectionRow,
   ButtonItem,
+  Focusable,
   Spinner,
 } from "@decky/ui";
 import {
@@ -588,7 +589,8 @@ const HoardContent: FC = () => {
             ) : (
               games.tracked.map((game) => (
                 <PanelSectionRow key={game.slug || game.name}>
-                  <div
+                  <Focusable
+                    onActivate={() => {}}
                     style={{
                       display: "flex",
                       alignItems: "center",
@@ -614,7 +616,7 @@ const HoardContent: FC = () => {
                       </span>
                     </div>
                     <Badge color="green">SYNCED</Badge>
-                  </div>
+                  </Focusable>
                 </PanelSectionRow>
               ))
             )}
@@ -643,7 +645,8 @@ const HoardContent: FC = () => {
                 </PanelSectionRow>
                 {games.missing_folder.map((game) => (
                   <PanelSectionRow key={game.slug || game.name}>
-                    <div
+                    <Focusable
+                      onActivate={() => {}}
                       style={{
                         display: "flex",
                         alignItems: "center",
@@ -666,7 +669,7 @@ const HoardContent: FC = () => {
                       >
                         {game.name}
                       </span>
-                    </div>
+                    </Focusable>
                   </PanelSectionRow>
                 ))}
               </>
