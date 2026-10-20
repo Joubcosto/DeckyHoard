@@ -5,7 +5,8 @@
   "type": "module",
   "scripts": {
     "build": "rollup -c",
-    "watch": "rollup -c -w"
+    "watch": "rollup -c -w",
+    "package": "./package.sh"
   },
   "author": "logosmax",
   "license": "AGPL-3.0",
