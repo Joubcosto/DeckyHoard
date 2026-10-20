@@ -1,0 +1,8 @@
+{
+  "name": "Hoard Sync",
+  "author": "logosmax",
+  "flags": ["debug"],
+  "version": "0.5.0",
+  "api_version": 1,
+  "description": "Sync and track game saves with Hoard CLI directly from SteamOS & Bazzite Game Mode."
+}
