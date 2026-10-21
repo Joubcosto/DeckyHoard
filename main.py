@@ -3,7 +3,6 @@ import hashlib
 import json
 import logging
 import os
-import pathlib
 import pwd
 import re
 import shutil
@@ -17,8 +16,11 @@ try:
 except ImportError:
     decky = None
 
-logger = logging.getLogger("decky-hoard")
-logger.setLevel(logging.INFO)
+if decky and hasattr(decky, "logger"):
+    logger = decky.logger
+else:
+    logger = logging.getLogger("decky-hoard")
+    logger.setLevel(logging.INFO)
 
 # Known Steam tool / runtime AppIDs to exclude from game list
 EXCLUDED_APPIDS = {
@@ -67,8 +69,22 @@ def _get_decky_user_info() -> Tuple[str, int, int, str]:
         user_name = getattr(decky, "DECKY_USER", None)
         user_home = getattr(decky, "DECKY_USER_HOME", None)
 
-    if not user_name:
+    if not user_name or user_name == "root":
         user_name = os.environ.get("DECKY_USER") or os.environ.get("SUDO_USER")
+
+    # Extract username from plugin path (/home/<user>/... or /var/home/<user>/...)
+    if not user_name or user_name == "root":
+        abs_path = os.path.abspath(__file__)
+        m = re.match(r"^/var/home/([^/]+)|^/home/([^/]+)", abs_path)
+        if m:
+            candidate = m.group(1) or m.group(2)
+            try:
+                entry = pwd.getpwnam(candidate)
+                if entry.pw_uid >= 1000:
+                    user_name = entry.pw_name
+                    user_home = entry.pw_dir
+            except KeyError:
+                pass
 
     # If still root or unset, look for 'deck' user or first UID >= 1000 with a home dir
     if not user_name or user_name == "root":
@@ -78,7 +94,7 @@ def _get_decky_user_info() -> Tuple[str, int, int, str]:
             user_home = deck_entry.pw_dir
         except KeyError:
             for entry in pwd.getpwall():
-                if entry.pw_uid >= 1000 and os.path.exists(entry.pw_dir) and "/home" in entry.pw_dir:
+                if entry.pw_uid >= 1000 and os.path.exists(entry.pw_dir) and "home" in entry.pw_dir:
                     user_name = entry.pw_name
                     user_home = entry.pw_dir
                     break
@@ -92,7 +108,7 @@ def _get_decky_user_info() -> Tuple[str, int, int, str]:
     entry = pwd.getpwnam(user_name)
     user_uid = entry.pw_uid
     user_gid = entry.pw_gid
-    if not user_home:
+    if not user_home or user_home == "/root":
         user_home = entry.pw_dir
 
     return user_name, user_uid, user_gid, user_home
@@ -107,6 +123,10 @@ def _get_user_env(user_name: str, user_uid: int, user_home: str) -> Dict[str, st
     env["USER"] = user_name
     env["LOGNAME"] = user_name
     env["HOME"] = user_home
+    env["XDG_CONFIG_HOME"] = os.path.join(user_home, ".config")
+    env["XDG_DATA_HOME"] = os.path.join(user_home, ".local", "share")
+    env["XDG_STATE_HOME"] = os.path.join(user_home, ".local", "state")
+    env["XDG_CACHE_HOME"] = os.path.join(user_home, ".cache")
     env["XDG_RUNTIME_DIR"] = runtime_dir
     env["DBUS_SESSION_BUS_ADDRESS"] = bus_path
     bin_path = f"{user_home}/.local/bin"
@@ -114,42 +134,95 @@ def _get_user_env(user_name: str, user_uid: int, user_home: str) -> Dict[str, st
     return env
 
 
-class Plugin:
+class HoardBackend:
+    """
+    Actual stateful backend instance.
+    Decky Loader calls methods on the `Plugin` class directly without calling `Plugin.__init__()`,
+    so delegating to a singleton `HoardBackend` instance ensures state and bound methods work properly.
+    """
+
     def __init__(self):
-        self._lock = asyncio.Lock()
-        self._scan_lock = asyncio.Lock()
+        self._lock: Optional[asyncio.Lock] = None
+        self._scan_lock: Optional[asyncio.Lock] = None
         self._user_name, self._user_uid, self._user_gid, self._user_home = _get_decky_user_info()
         self._hoard_bin = os.path.join(self._user_home, ".local", "bin", "hoard")
         self._cached_games: Optional[Dict[str, Any]] = None
         self._is_scanning = False
         logger.info(
-            f"Initialized decky-hoard for user={self._user_name} (uid={self._user_uid}), bin={self._hoard_bin}"
+            f"Initialized HoardBackend for user={self._user_name} (uid={self._user_uid}, home={self._user_home}), bin={self._hoard_bin}"
         )
 
-    async def _main(self):
-        logger.info("Hoard plugin loaded.")
-        # Trigger an initial background scan without blocking startup
-        asyncio.create_task(self.get_games(force_refresh=False))
+    @property
+    def lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
-    async def _unload(self):
-        logger.info("Hoard plugin unloaded.")
+    @property
+    def scan_lock(self) -> asyncio.Lock:
+        if self._scan_lock is None:
+            self._scan_lock = asyncio.Lock()
+        return self._scan_lock
+
+    def _resolve_hoard_bin(self) -> str:
+        if os.path.isfile(self._hoard_bin) and os.access(self._hoard_bin, os.X_OK):
+            return self._hoard_bin
+        env = _get_user_env(self._user_name, self._user_uid, self._user_home)
+        found = shutil.which("hoard", path=env.get("PATH"))
+        if found:
+            self._hoard_bin = found
+        return self._hoard_bin
+
+    def _has_local_session_config(self) -> bool:
+        """
+        Check if Hoard has local configuration / credentials / token files in the user's home directory.
+        """
+        candidate_dirs = [
+            os.path.join(self._user_home, ".config", "hoard"),
+            os.path.join(self._user_home, ".local", "share", "hoard"),
+            os.path.join(self._user_home, ".hoard"),
+        ]
+        auth_keywords = ("token", "session", "auth", "credential", "api_key", "server", "user", "email")
+
+        for d in candidate_dirs:
+            if not os.path.isdir(d):
+                continue
+            try:
+                for root, _, files in os.walk(d):
+                    for fname in files:
+                        fpath = os.path.join(root, fname)
+                        lower_name = fname.lower()
+                        if lower_name in ("credentials", "credentials.json", "credentials.toml", "session.json", "auth.json", "token"):
+                            if os.path.getsize(fpath) > 0:
+                                return True
+                        if lower_name.endswith((".toml", ".json", ".yaml", ".yml", ".conf")):
+                            try:
+                                with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
+                                    content = f.read(16384).lower()
+                                if any(k in content for k in auth_keywords):
+                                    return True
+                            except Exception:
+                                pass
+            except Exception:
+                pass
+        return False
 
     async def _run_hoard(self, *args: str, timeout: int = 60) -> Dict[str, Any]:
         """
         Execute the Hoard CLI as DECKY_USER with standard environment and stdin=DEVNULL.
         """
-        if not os.path.exists(self._hoard_bin):
+        hoard_bin = self._resolve_hoard_bin()
+        if not os.path.exists(hoard_bin):
             return {
                 "ok": False,
                 "returncode": -1,
                 "error": "not_installed",
-                "message": f"Hoard binary not found at {self._hoard_bin}",
+                "message": f"Hoard binary not found at {hoard_bin}",
             }
 
-        cmd = [self._hoard_bin, *args]
+        cmd = [hoard_bin, *args]
         env = _get_user_env(self._user_name, self._user_uid, self._user_home)
 
-        # Drop privileges if currently running as root
         kwargs: Dict[str, Any] = {
             "stdin": asyncio.subprocess.DEVNULL,
             "stdout": asyncio.subprocess.PIPE,
@@ -204,7 +277,8 @@ class Plugin:
         """
         Check Hoard installation status, user session (login), and background sync service.
         """
-        installed = os.path.isfile(self._hoard_bin) and os.access(self._hoard_bin, os.X_OK)
+        hoard_bin = self._resolve_hoard_bin()
+        installed = os.path.isfile(hoard_bin) and os.access(hoard_bin, os.X_OK)
         if not installed:
             return {
                 "installed": False,
@@ -213,27 +287,14 @@ class Plugin:
                 "user_info": None,
                 "service_running": False,
                 "is_scanning": self._is_scanning,
-                "binary_path": self._hoard_bin,
+                "binary_path": hoard_bin,
             }
 
-        # Check version
+        # 1. Check version
         version_res = await self._run_hoard("--version", timeout=10)
         version = version_res.get("stdout") if version_res["ok"] else "Installed"
 
-        # Check session (hoard whoami --json)
-        whoami_res = await self._run_hoard("whoami", "--json", timeout=15)
-        logged_in = False
-        user_info = None
-
-        if whoami_res["ok"] and whoami_res.get("data"):
-            logged_in = True
-            user_info = whoami_res["data"].get("data")
-        elif whoami_res.get("returncode") == 2:
-            # Code 2 = no_session
-            logged_in = False
-            user_info = None
-
-        # Check sync service via systemctl --user is-active hoard-sync.service
+        # 2. Check sync service via systemctl --user is-active hoard-sync.service
         service_running = False
         try:
             env = _get_user_env(self._user_name, self._user_uid, self._user_home)
@@ -255,9 +316,78 @@ class Plugin:
             service_running = status_text == "active"
         except Exception as e:
             logger.warning(f"Error checking systemctl service: {e}")
-            # Fallback to hoard sync status
-            sync_res = await self._run_hoard("sync", timeout=5)
-            service_running = "service: running" in (sync_res.get("stdout") or "")
+
+        sync_res = await self._run_hoard("sync", timeout=8)
+        stdout_sync = (sync_res.get("stdout") or "").lower()
+        stderr_sync = (sync_res.get("stderr") or "").lower()
+        if not service_running:
+            service_running = (
+                ("running" in stdout_sync and "not running" not in stdout_sync)
+                or ("active" in stdout_sync and "inactive" not in stdout_sync)
+            )
+
+        # 3. Check session / login state using multiple signals
+        logged_in = False
+        user_info = None
+        not_logged_phrases = (
+            "not logged in",
+            "no session",
+            "no_session",
+            "not authenticated",
+            "unauthenticated",
+            "please login",
+            "please log in",
+            "run 'hoard login'",
+            "run `hoard login`",
+        )
+        cli_error_phrases = (
+            "unexpected argument",
+            "unrecognized subcommand",
+            "invalid subcommand",
+            "unknown option",
+            "found argument",
+        )
+
+        # Signal A: Try `hoard whoami --json` then `hoard whoami`
+        whoami_res = await self._run_hoard("whoami", "--json", timeout=10)
+        combined_whoami = f"{whoami_res.get('stdout') or ''}\n{whoami_res.get('stderr') or ''}".lower()
+        if not whoami_res["ok"] and any(p in combined_whoami for p in cli_error_phrases):
+            whoami_res = await self._run_hoard("whoami", timeout=10)
+            combined_whoami = f"{whoami_res.get('stdout') or ''}\n{whoami_res.get('stderr') or ''}".lower()
+
+        explicitly_logged_out = False
+        if any(p in combined_whoami for p in not_logged_phrases):
+            explicitly_logged_out = True
+        elif isinstance(whoami_res.get("data"), dict):
+            raw_data = whoami_res["data"]
+            err_val = str(raw_data.get("error") or "").lower()
+            msg_val = str(raw_data.get("message") or "").lower()
+            if any(p in err_val or p in msg_val for p in not_logged_phrases):
+                explicitly_logged_out = True
+            elif raw_data.get("ok") is not False:
+                logged_in = True
+                user_info = raw_data.get("data", raw_data)
+        elif whoami_res["ok"]:
+            logged_in = True
+            user_info = {"user": whoami_res.get("stdout")}
+
+        # Signal B: If sync daemon is active, or `hoard sync` succeeded without a login error, or local session config exists
+        if not logged_in and not explicitly_logged_out:
+            combined_sync = f"{stdout_sync}\n{stderr_sync}"
+            if service_running:
+                logged_in = True
+            elif sync_res["ok"] and not any(p in combined_sync for p in not_logged_phrases):
+                logged_in = True
+            elif self._has_local_session_config():
+                logged_in = True
+
+        # Signal C: Even if whoami failed (e.g. offline or self-hosted server), if local config + daemon are active, consider logged in
+        if not logged_in and (service_running or self._has_local_session_config()):
+            logged_in = True
+
+        logger.info(
+            f"Status check: installed={installed}, logged_in={logged_in}, service_running={service_running}"
+        )
 
         return {
             "installed": True,
@@ -266,14 +396,14 @@ class Plugin:
             "user_info": user_info,
             "service_running": service_running,
             "is_scanning": self._is_scanning,
-            "binary_path": self._hoard_bin,
+            "binary_path": hoard_bin,
         }
 
     async def install_hoard(self) -> Dict[str, Any]:
         """
         Download HoardSetup-x86_64, verify SHA256 checksum, and run with --silent as DECKY_USER.
         """
-        async with self._lock:
+        async with self.lock:
             arch = os.uname().machine
             if arch != "x86_64":
                 return {
@@ -296,7 +426,6 @@ class Plugin:
                     with urllib.request.urlopen(req, timeout=120) as resp, open(installer_path, "wb") as f:
                         shutil.copyfileobj(resp, f)
 
-                    # Fetch expected checksum
                     expected_sha256 = None
                     try:
                         chk_req = urllib.request.Request(checksum_url, headers={"User-Agent": "decky-hoard"})
@@ -306,7 +435,6 @@ class Plugin:
                     except Exception as e:
                         logger.warning(f"Failed to fetch .sha256 checksum file: {e}")
 
-                    # Verify checksum if available
                     if expected_sha256:
                         hasher = hashlib.sha256()
                         with open(installer_path, "rb") as f:
@@ -326,12 +454,10 @@ class Plugin:
                 if verify_err:
                     return verify_err
 
-                # Make executable and transfer ownership
                 os.chmod(installer_path, 0o755)
                 if os.geteuid() == 0:
                     os.chown(installer_path, self._user_uid, self._user_gid)
 
-                # Execute HoardSetup --silent
                 env = _get_user_env(self._user_name, self._user_uid, self._user_home)
                 cmd = [installer_path, "--silent"]
                 kwargs: Dict[str, Any] = {
@@ -359,7 +485,6 @@ class Plugin:
                         "message": f"HoardSetup failed with code {proc.returncode}: {stderr_str or stdout_str}",
                     }
 
-                # Ensure permissions on binaries in ~/.local/bin
                 local_bin = os.path.join(self._user_home, ".local", "bin")
                 for bin_name in ["hoard", "hoardd"]:
                     bp = os.path.join(local_bin, bin_name)
@@ -368,14 +493,15 @@ class Plugin:
                         if os.geteuid() == 0:
                             os.chown(bp, self._user_uid, self._user_gid)
 
-                if os.path.isfile(self._hoard_bin):
+                hoard_bin = self._resolve_hoard_bin()
+                if os.path.isfile(hoard_bin):
                     logger.info("Hoard successfully installed!")
                     return {"ok": True, "message": "Hoard installed successfully!"}
                 else:
                     return {
                         "ok": False,
                         "error": "binary_missing",
-                        "message": f"Installation finished but binary missing at {self._hoard_bin}",
+                        "message": f"Installation finished but binary missing at {hoard_bin}",
                     }
 
             except Exception as e:
@@ -388,16 +514,10 @@ class Plugin:
         """
         Synchronize saves: start or restart the background sync daemon hoardd.
         """
-        async with self._lock:
+        async with self.lock:
             status = await self.get_status()
             if not status.get("installed"):
                 return {"ok": False, "message": "Hoard is not installed"}
-
-            if not status.get("logged_in"):
-                return {
-                    "ok": False,
-                    "message": "Not signed in to Hoard. Please run 'hoard login' in Desktop Mode.",
-                }
 
             if status.get("service_running"):
                 res = await self._run_hoard("sync", "restart", timeout=30)
@@ -419,7 +539,7 @@ class Plugin:
         """
         Track a game with Hoard CLI using exact slug if available, else fuzzy game name.
         """
-        async with self._lock:
+        async with self.lock:
             if slug:
                 args = ["track", "--slug", slug]
             else:
@@ -429,7 +549,6 @@ class Plugin:
             res = await self._run_hoard(*args, timeout=120)
 
             if res["ok"]:
-                # Update cached game tracking state locally
                 if self._cached_games:
                     norm_target = _normalize_name(slug or game_name)
                     for category in ["ready_to_track", "other_games"]:
@@ -440,7 +559,6 @@ class Plugin:
                                 self._cached_games[category].remove(game)
                                 self._cached_games["tracked"].append(game)
                                 break
-                    # Update counts
                     self._update_cached_summary()
 
                 return {
@@ -497,7 +615,6 @@ class Plugin:
                 try:
                     with open(vdf_path, "r", encoding="utf-8", errors="replace") as f:
                         content = f.read()
-                    # Extract "path" "/mount/point"
                     matches = re.findall(r'"path"\s+"([^"]+)"', content)
                     for path in matches:
                         if os.path.isdir(path):
@@ -527,7 +644,6 @@ class Plugin:
                         with open(entry.path, "r", encoding="utf-8", errors="replace") as f:
                             text = f.read()
 
-                        # Parse appid and name
                         appid_match = re.search(r'"appid"\s+"([^"]+)"', text)
                         name_match = re.search(r'"name"\s+"([^"]+)"', text)
                         if not appid_match or not name_match:
@@ -539,7 +655,6 @@ class Plugin:
                         if appid in seen_appids or appid in EXCLUDED_APPIDS:
                             continue
 
-                        # Check name patterns
                         if any(pattern.search(name) for pattern in EXCLUDED_NAME_PATTERNS):
                             continue
 
@@ -569,7 +684,7 @@ class Plugin:
            - tracked
            - missing_folder
         """
-        async with self._scan_lock:
+        async with self.scan_lock:
             if self._cached_games and not force_refresh:
                 return self._cached_games
 
@@ -583,25 +698,44 @@ class Plugin:
                 tracked_names: set = set()
                 saves_res = await self._run_hoard("saves", "--json", timeout=20)
                 if saves_res["ok"] and saves_res.get("data"):
-                    saves_list = saves_res["data"].get("data", {}).get("saves", [])
+                    raw_saves = saves_res["data"]
+                    if isinstance(raw_saves, dict):
+                        inner = raw_saves.get("data", raw_saves)
+                        saves_list = inner.get("saves", []) if isinstance(inner, dict) else (inner if isinstance(inner, list) else [])
+                    elif isinstance(raw_saves, list):
+                        saves_list = raw_saves
+                    else:
+                        saves_list = []
+
                     for s in saves_list:
-                        if s.get("slug"):
-                            tracked_slugs.add(s["slug"].lower())
-                        if s.get("game_name"):
-                            tracked_names.add(_normalize_name(s["game_name"]))
+                        if isinstance(s, dict):
+                            if s.get("slug"):
+                                tracked_slugs.add(str(s["slug"]).lower())
+                            if s.get("game_name"):
+                                tracked_names.add(_normalize_name(str(s["game_name"])))
 
                 # 3. Query hoard scan --json
                 scan_games_map: Dict[str, Dict[str, Any]] = {}
                 scan_res = await self._run_hoard("scan", "--json", timeout=180)
                 if scan_res["ok"] and scan_res.get("data"):
-                    scanned_list = scan_res["data"].get("data", {}).get("games", [])
+                    raw_scan = scan_res["data"]
+                    if isinstance(raw_scan, dict):
+                        inner = raw_scan.get("data", raw_scan)
+                        scanned_list = inner.get("games", []) if isinstance(inner, dict) else (inner if isinstance(inner, list) else [])
+                    elif isinstance(raw_scan, list):
+                        scanned_list = raw_scan
+                    else:
+                        scanned_list = []
+
                     for sg in scanned_list:
-                        slug = sg.get("slug", "")
-                        disp_name = sg.get("display_name", "")
-                        norm = _normalize_name(disp_name or slug)
-                        scan_games_map[norm] = sg
-                        if slug:
-                            scan_games_map[slug.lower()] = sg
+                        if isinstance(sg, dict):
+                            slug = sg.get("slug", "")
+                            disp_name = sg.get("display_name", "")
+                            norm = _normalize_name(disp_name or slug)
+                            if norm:
+                                scan_games_map[norm] = sg
+                            if slug:
+                                scan_games_map[slug.lower()] = sg
 
                 ready_to_track: List[Dict[str, Any]] = []
                 other_games: List[Dict[str, Any]] = []
@@ -615,7 +749,6 @@ class Plugin:
                     appid = sg["appid"]
                     norm = _normalize_name(name)
 
-                    # Match with scan entry
                     scan_entry = scan_games_map.get(norm)
 
                     is_tracked = False
@@ -654,7 +787,7 @@ class Plugin:
                     else:
                         other_games.append(item)
 
-                # Include any scanned games that are already tracked but weren't in Steam manifests (e.g. GOG, Epic, emulators)
+                # Include any scanned games that are already tracked but weren't in Steam manifests
                 for norm, sg in scan_games_map.items():
                     slug = sg.get("slug")
                     if not slug or slug.lower() in seen_tracked_slugs:
@@ -671,7 +804,6 @@ class Plugin:
                             "tracked": True,
                         })
 
-                # Sort alphabetically within each category
                 ready_to_track.sort(key=lambda x: x["name"].lower())
                 other_games.sort(key=lambda x: x["name"].lower())
                 tracked.sort(key=lambda x: x["name"].lower())
@@ -695,3 +827,38 @@ class Plugin:
                 return result
             finally:
                 self._is_scanning = False
+
+
+_backend: Optional[HoardBackend] = None
+
+
+def _get_backend() -> HoardBackend:
+    global _backend
+    if _backend is None:
+        _backend = HoardBackend()
+    return _backend
+
+
+class Plugin:
+    async def _main(self):
+        logger.info("Hoard plugin loaded.")
+        backend = _get_backend()
+        asyncio.create_task(backend.get_games(force_refresh=False))
+
+    async def _unload(self):
+        logger.info("Hoard plugin unloaded.")
+
+    async def get_status(self) -> Dict[str, Any]:
+        return await _get_backend().get_status()
+
+    async def install_hoard(self) -> Dict[str, Any]:
+        return await _get_backend().install_hoard()
+
+    async def force_sync(self) -> Dict[str, Any]:
+        return await _get_backend().force_sync()
+
+    async def track_game(self, game_name: str, slug: Optional[str] = None) -> Dict[str, Any]:
+        return await _get_backend().track_game(game_name, slug)
+
+    async def get_games(self, force_refresh: bool = False) -> Dict[str, Any]:
+        return await _get_backend().get_games(force_refresh)

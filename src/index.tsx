@@ -293,7 +293,6 @@ const HoardContent: FC = () => {
 
   // Sync Now
   const handleSyncNow = async () => {
-    if (!status?.logged_in) return;
     setIsSyncing(true);
     toaster.toast({
       title: t.pluginTitle,
@@ -330,7 +329,6 @@ const HoardContent: FC = () => {
 
   // Track Game
   const handleTrack = async (game: GameItem) => {
-    if (!status?.logged_in) return;
     const gameIdentifier = game.slug || game.name;
     setTrackingGame(gameIdentifier);
 
@@ -347,7 +345,6 @@ const HoardContent: FC = () => {
           body: `"${game.name}" ${t.trackSuccess}`,
           duration: 3000,
         });
-        // Refresh local games view from backend cache
         fetchGames(false);
       } else {
         toaster.toast({
@@ -411,9 +408,11 @@ const HoardContent: FC = () => {
             layout="below"
             onClick={handleInstall}
             disabled={isInstalling}
-            icon={isInstalling ? <Spinner /> : <FaDownload />}
           >
-            {isInstalling ? t.installing : t.installBtn}
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "8px" }}>
+              {isInstalling ? <Spinner /> : <FaDownload />}
+              <span>{isInstalling ? t.installing : t.installBtn}</span>
+            </div>
           </ButtonItem>
         </PanelSectionRow>
       </PanelSection>
@@ -474,10 +473,12 @@ const HoardContent: FC = () => {
           <ButtonItem
             layout="below"
             onClick={handleSyncNow}
-            disabled={!status.logged_in || isSyncing}
-            icon={isSyncing ? <Spinner /> : <FaSyncAlt />}
+            disabled={isSyncing}
           >
-            {isSyncing ? t.syncing : t.syncNow}
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "8px" }}>
+              {isSyncing ? <Spinner /> : <FaSyncAlt />}
+              <span>{isSyncing ? t.syncing : t.syncNow}</span>
+            </div>
           </ButtonItem>
         </PanelSectionRow>
 
@@ -487,9 +488,11 @@ const HoardContent: FC = () => {
             layout="below"
             onClick={() => fetchGames(true)}
             disabled={isLoadingGames}
-            icon={isLoadingGames ? <Spinner /> : <FaGamepad />}
           >
-            {isLoadingGames ? t.scanning : t.refreshBtn}
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "8px" }}>
+              {isLoadingGames ? <Spinner /> : <FaGamepad />}
+              <span>{isLoadingGames ? t.scanning : t.refreshBtn}</span>
+            </div>
           </ButtonItem>
         </PanelSectionRow>
       </PanelSection>
@@ -524,16 +527,16 @@ const HoardContent: FC = () => {
                 return (
                   <PanelSectionRow key={game.slug || game.name}>
                     <ButtonItem
-                      layout="inline"
+                      layout="below"
+                      description={game.slug ? `slug: ${game.slug}` : undefined}
                       onClick={() => handleTrack(game)}
-                      disabled={!status.logged_in || isItemTracking}
-                      icon={isItemTracking ? <Spinner /> : <FaPlus style={{ color: "#3498db" }} />}
+                      disabled={isItemTracking}
                     >
-                      <div style={{ display: "flex", flexDirection: "column", textAlign: "left", width: "100%" }}>
-                        <span style={{ fontSize: "13px", fontWeight: "500" }}>{game.name}</span>
-                        {game.slug && (
-                          <span style={{ fontSize: "10px", color: "#888" }}>slug: {game.slug}</span>
-                        )}
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%", gap: "8px" }}>
+                        <span style={{ fontSize: "13px", fontWeight: "500", overflow: "hidden", textOverflow: "ellipsis" }}>
+                          {game.name}
+                        </span>
+                        {isItemTracking ? <Spinner /> : <FaPlus style={{ color: "#3498db", flexShrink: 0 }} />}
                       </div>
                     </ButtonItem>
                   </PanelSectionRow>
@@ -558,16 +561,16 @@ const HoardContent: FC = () => {
                 return (
                   <PanelSectionRow key={game.appid || game.name}>
                     <ButtonItem
-                      layout="inline"
+                      layout="below"
+                      description={game.appid ? `AppID: ${game.appid}` : undefined}
                       onClick={() => handleTrack(game)}
-                      disabled={!status.logged_in || isItemTracking}
-                      icon={isItemTracking ? <Spinner /> : <FaPlus style={{ color: "#bdc3c7" }} />}
+                      disabled={isItemTracking}
                     >
-                      <div style={{ display: "flex", flexDirection: "column", textAlign: "left", width: "100%" }}>
-                        <span style={{ fontSize: "13px", fontWeight: "500" }}>{game.name}</span>
-                        {game.appid && (
-                          <span style={{ fontSize: "10px", color: "#888" }}>AppID: {game.appid}</span>
-                        )}
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%", gap: "8px" }}>
+                        <span style={{ fontSize: "13px", fontWeight: "500", overflow: "hidden", textOverflow: "ellipsis" }}>
+                          {game.name}
+                        </span>
+                        {isItemTracking ? <Spinner /> : <FaPlus style={{ color: "#bdc3c7", flexShrink: 0 }} />}
                       </div>
                     </ButtonItem>
                   </PanelSectionRow>
@@ -630,9 +633,11 @@ const HoardContent: FC = () => {
               <ButtonItem
                 layout="below"
                 onClick={() => setShowMissingFolder((prev) => !prev)}
-                icon={showMissingFolder ? <FaChevronDown /> : <FaChevronRight />}
               >
-                {showMissingFolder ? t.collapse : t.expand} ({games.summary.missing_count})
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "8px" }}>
+                  {showMissingFolder ? <FaChevronDown /> : <FaChevronRight />}
+                  <span>{showMissingFolder ? t.collapse : t.expand} ({games.summary.missing_count})</span>
+                </div>
               </ButtonItem>
             </PanelSectionRow>
 
