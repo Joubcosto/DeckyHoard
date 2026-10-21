@@ -5,6 +5,7 @@ import logging
 import os
 import pwd
 import re
+import shlex
 import shutil
 import tempfile
 import urllib.request
@@ -118,18 +119,20 @@ def _get_user_env(user_name: str, user_uid: int, user_home: str) -> Dict[str, st
     """Prepare environment variables needed by Hoard and systemd --user."""
     runtime_dir = f"/run/user/{user_uid}"
     bus_path = f"unix:path={runtime_dir}/bus"
+    real_home = os.path.realpath(user_home)
 
     env = dict(os.environ)
     env["USER"] = user_name
     env["LOGNAME"] = user_name
     env["HOME"] = user_home
+    env["SHELL"] = "/bin/bash"
     env["XDG_CONFIG_HOME"] = os.path.join(user_home, ".config")
     env["XDG_DATA_HOME"] = os.path.join(user_home, ".local", "share")
     env["XDG_STATE_HOME"] = os.path.join(user_home, ".local", "state")
     env["XDG_CACHE_HOME"] = os.path.join(user_home, ".cache")
     env["XDG_RUNTIME_DIR"] = runtime_dir
     env["DBUS_SESSION_BUS_ADDRESS"] = bus_path
-    bin_path = f"{user_home}/.local/bin"
+    bin_path = f"{user_home}/.local/bin:{real_home}/.local/bin"
     env["PATH"] = f"{bin_path}:/usr/local/bin:/usr/bin:/bin:{env.get('PATH', '')}"
     return env
 
@@ -209,18 +212,10 @@ class HoardBackend:
 
     async def _run_hoard(self, *args: str, timeout: int = 60) -> Dict[str, Any]:
         """
-        Execute the Hoard CLI as DECKY_USER with standard environment and stdin=DEVNULL.
+        Execute `hoard <args>` via `/bin/bash -lc` as DECKY_USER with standard environment.
         """
-        hoard_bin = self._resolve_hoard_bin()
-        if not os.path.exists(hoard_bin):
-            return {
-                "ok": False,
-                "returncode": -1,
-                "error": "not_installed",
-                "message": f"Hoard binary not found at {hoard_bin}",
-            }
-
-        cmd = [hoard_bin, *args]
+        hoard_cmd = shlex.join(["hoard", *args])
+        cmd = ["/bin/bash", "-lc", hoard_cmd]
         env = _get_user_env(self._user_name, self._user_uid, self._user_home)
 
         kwargs: Dict[str, Any] = {
@@ -242,12 +237,27 @@ class HoardBackend:
             stderr_str = stderr_b.decode("utf-8", errors="replace").strip()
             rc = proc.returncode
 
+            if rc == 127:
+                return {
+                    "ok": False,
+                    "returncode": rc,
+                    "error": "not_installed",
+                    "stdout": stdout_str,
+                    "stderr": stderr_str,
+                    "message": "Hoard command not found in /bin/bash PATH",
+                }
+
             data = None
             if stdout_str:
                 try:
                     data = json.loads(stdout_str)
                 except Exception:
-                    data = None
+                    brace_idx = stdout_str.find("{")
+                    if brace_idx != -1:
+                        try:
+                            data = json.loads(stdout_str[brace_idx:])
+                        except Exception:
+                            data = None
 
             return {
                 "ok": rc == 0,
@@ -257,7 +267,7 @@ class HoardBackend:
                 "data": data,
             }
         except asyncio.TimeoutError:
-            logger.error(f"Command timed out ({timeout}s): {' '.join(cmd)}")
+            logger.error(f"Command timed out ({timeout}s): {hoard_cmd}")
             return {
                 "ok": False,
                 "returncode": -2,
@@ -265,7 +275,7 @@ class HoardBackend:
                 "message": f"Command timed out after {timeout} seconds",
             }
         except Exception as e:
-            logger.exception(f"Error running Hoard command {' '.join(cmd)}: {e}")
+            logger.exception(f"Error running Hoard command {hoard_cmd}: {e}")
             return {
                 "ok": False,
                 "returncode": -3,
@@ -279,6 +289,11 @@ class HoardBackend:
         """
         hoard_bin = self._resolve_hoard_bin()
         installed = os.path.isfile(hoard_bin) and os.access(hoard_bin, os.X_OK)
+
+        # 1. Check version via /bin/bash -lc "hoard --version"
+        version_res = await self._run_hoard("--version", timeout=10)
+        if version_res["ok"]:
+            installed = True
         if not installed:
             return {
                 "installed": False,
@@ -290,15 +305,13 @@ class HoardBackend:
                 "binary_path": hoard_bin,
             }
 
-        # 1. Check version
-        version_res = await self._run_hoard("--version", timeout=10)
         version = version_res.get("stdout") if version_res["ok"] else "Installed"
 
-        # 2. Check sync service via systemctl --user is-active hoard-sync.service
+        # 2. Check sync service via /bin/bash -lc "systemctl --user is-active hoard-sync.service"
         service_running = False
         try:
             env = _get_user_env(self._user_name, self._user_uid, self._user_home)
-            cmd = ["systemctl", "--user", "is-active", "hoard-sync.service"]
+            cmd = ["/bin/bash", "-lc", "systemctl --user is-active hoard-sync.service"]
             kwargs: Dict[str, Any] = {
                 "stdin": asyncio.subprocess.DEVNULL,
                 "stdout": asyncio.subprocess.PIPE,
@@ -510,9 +523,35 @@ class HoardBackend:
             finally:
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
+    async def _get_tracked_saves_list(self) -> List[Dict[str, Any]]:
+        """
+        Query `hoard saves --json` and return the list of tracked save entries.
+        Each entry typically contains `save_id`, `game_slug`, `label`, `local_path`, etc.
+        """
+        saves_res = await self._run_hoard("saves", "--json", timeout=20)
+        if not (saves_res["ok"] and saves_res.get("data")):
+            return []
+
+        raw_saves = saves_res["data"]
+        if isinstance(raw_saves, dict):
+            inner = raw_saves.get("data", raw_saves)
+            saves_list = (
+                inner.get("saves", [])
+                if isinstance(inner, dict)
+                else (inner if isinstance(inner, list) else [])
+            )
+        elif isinstance(raw_saves, list):
+            saves_list = raw_saves
+        else:
+            saves_list = []
+
+        return [s for s in saves_list if isinstance(s, dict)]
+
     async def force_sync(self) -> Dict[str, Any]:
         """
-        Synchronize saves: start or restart the background sync daemon hoardd.
+        Synchronize saves: start or restart the background sync daemon hoardd,
+        and run `hoard backup <save_id>` for all tracked saves so changes are
+        immediately uploaded to the cloud/server.
         """
         async with self.lock:
             status = await self.get_status()
@@ -526,36 +565,101 @@ class HoardBackend:
                 res = await self._run_hoard("sync", "start", timeout=30)
                 action = "started"
 
-            if res["ok"]:
+            # Upload all tracked saves immediately
+            saves_list = await self._get_tracked_saves_list()
+            backed_up = 0
+            backup_errors: List[str] = []
+            for s in saves_list:
+                save_id = s.get("save_id")
+                if not save_id or s.get("paused"):
+                    continue
+                b_res = await self._run_hoard("backup", str(save_id), timeout=180)
+                if b_res["ok"]:
+                    backed_up += 1
+                else:
+                    err = b_res.get("stderr") or b_res.get("stdout") or "Backup error"
+                    logger.warning(f"Backup failed for save_id={save_id}: {err}")
+                    backup_errors.append(err)
+
+            if res["ok"] or backed_up > 0:
                 return {
                     "ok": True,
-                    "message": f"Hoard sync daemon {action} successfully! Syncing active.",
+                    "message": f"Hoard sync daemon {action} ({backed_up} save(s) backed up).",
                 }
             else:
-                err_msg = res.get("stderr") or res.get("stdout") or "Unknown error"
+                err_msg = (
+                    (backup_errors[0] if backup_errors else None)
+                    or res.get("stderr")
+                    or res.get("stdout")
+                    or "Unknown error"
+                )
                 return {"ok": False, "message": f"Sync failed: {err_msg}"}
 
     async def track_game(self, game_name: str, slug: Optional[str] = None) -> Dict[str, Any]:
         """
-        Track a game with Hoard CLI using exact slug if available, else fuzzy game name.
+        Track a game with Hoard CLI (`hoard track <game_name>`, with fallback to `--slug`),
+        then immediately trigger `hoard backup <save_id>` so the save is uploaded to the cloud.
         """
         async with self.lock:
-            if slug:
-                args = ["track", "--slug", slug]
-            else:
-                args = ["track", game_name]
-
+            args = ["track", game_name]
             logger.info(f"Tracking game with args: {args}")
             res = await self._run_hoard(*args, timeout=120)
 
+            if not res["ok"] and slug:
+                fallback_args = ["track", "--slug", slug]
+                logger.info(f"Fallback tracking game with args: {fallback_args}")
+                res = await self._run_hoard(*fallback_args, timeout=120)
+
             if res["ok"]:
+                stdout_text = res.get("stdout") or ""
+
+                # Extract resolved slug and save_id from `hoard track` output if present:
+                #   tracking <display_name> (<slug>)
+                #     path:    <path>
+                #     save_id: <uuid>
+                resolved_slug = slug
+                slug_match = re.search(r"^tracking\s+.+\(([^)]+)\)", stdout_text, re.MULTILINE)
+                if slug_match:
+                    resolved_slug = slug_match.group(1).strip()
+
+                save_id: Optional[str] = None
+                save_id_match = re.search(r"save_id:\s*([0-9a-fA-F-]{36}|\S+)", stdout_text)
+                if save_id_match:
+                    save_id = save_id_match.group(1).strip()
+
+                # Fallback: look up save_id via `hoard saves --json`
+                if not save_id:
+                    saves_list = await self._get_tracked_saves_list()
+                    target_norms = {
+                        _normalize_name(game_name),
+                        _normalize_name(resolved_slug or ""),
+                        _normalize_name(slug or ""),
+                    } - {""}
+                    for s in saves_list:
+                        s_slug = str(s.get("game_slug") or s.get("slug") or "")
+                        if _normalize_name(s_slug) in target_norms:
+                            save_id = str(s.get("save_id") or "") or None
+                            if not resolved_slug and s_slug:
+                                resolved_slug = s_slug
+                            break
+
+                # Immediately upload the first snapshot to Cloud / Server
+                if save_id:
+                    logger.info(f"Uploading initial backup for '{game_name}' (save_id={save_id})...")
+                    backup_res = await self._run_hoard("backup", save_id, timeout=180)
+                    if not backup_res["ok"]:
+                        b_err = backup_res.get("stderr") or backup_res.get("stdout") or "Unknown backup error"
+                        logger.warning(f"Initial backup failed for {game_name} ({save_id}): {b_err}")
+
                 if self._cached_games:
-                    norm_target = _normalize_name(slug or game_name)
+                    norm_target = _normalize_name(resolved_slug or slug or game_name)
                     for category in ["ready_to_track", "other_games"]:
                         for game in list(self._cached_games.get(category, [])):
                             game_norm = _normalize_name(game.get("slug") or game.get("name", ""))
                             if game_norm == norm_target or _normalize_name(game.get("name", "")) == _normalize_name(game_name):
                                 game["tracked"] = True
+                                if resolved_slug and not game.get("slug"):
+                                    game["slug"] = resolved_slug
                                 self._cached_games[category].remove(game)
                                 self._cached_games["tracked"].append(game)
                                 break
@@ -564,7 +668,8 @@ class HoardBackend:
                 return {
                     "ok": True,
                     "message": f"Game '{game_name}' is now being tracked by Hoard!",
-                    "slug": slug,
+                    "slug": resolved_slug,
+                    "save_id": save_id,
                 }
             else:
                 err_msg = res.get("stderr") or res.get("stdout") or "Tracking failed"
@@ -696,26 +801,23 @@ class HoardBackend:
                 # 2. Query hoard saves (tracked saves)
                 tracked_slugs: set = set()
                 tracked_names: set = set()
-                saves_res = await self._run_hoard("saves", "--json", timeout=20)
-                if saves_res["ok"] and saves_res.get("data"):
-                    raw_saves = saves_res["data"]
-                    if isinstance(raw_saves, dict):
-                        inner = raw_saves.get("data", raw_saves)
-                        saves_list = inner.get("saves", []) if isinstance(inner, dict) else (inner if isinstance(inner, list) else [])
-                    elif isinstance(raw_saves, list):
-                        saves_list = raw_saves
-                    else:
-                        saves_list = []
-
-                    for s in saves_list:
-                        if isinstance(s, dict):
-                            if s.get("slug"):
-                                tracked_slugs.add(str(s["slug"]).lower())
-                            if s.get("game_name"):
-                                tracked_names.add(_normalize_name(str(s["game_name"])))
+                tracked_paths: set = set()
+                saves_list = await self._get_tracked_saves_list()
+                for s in saves_list:
+                    g_slug = str(s.get("game_slug") or s.get("slug") or "").strip()
+                    if g_slug:
+                        tracked_slugs.add(g_slug.lower())
+                        tracked_names.add(_normalize_name(g_slug))
+                    g_name = str(s.get("game_name") or "").strip()
+                    if g_name:
+                        tracked_names.add(_normalize_name(g_name))
+                    l_path = str(s.get("local_path") or "").strip()
+                    if l_path:
+                        tracked_paths.add(l_path)
 
                 # 3. Query hoard scan --json
                 scan_games_map: Dict[str, Dict[str, Any]] = {}
+                scanned_entries: List[Dict[str, Any]] = []
                 scan_res = await self._run_hoard("scan", "--json", timeout=180)
                 if scan_res["ok"] and scan_res.get("data"):
                     raw_scan = scan_res["data"]
@@ -729,11 +831,15 @@ class HoardBackend:
 
                     for sg in scanned_list:
                         if isinstance(sg, dict):
+                            scanned_entries.append(sg)
                             slug = sg.get("slug", "")
                             disp_name = sg.get("display_name", "")
-                            norm = _normalize_name(disp_name or slug)
-                            if norm:
-                                scan_games_map[norm] = sg
+                            norm_disp = _normalize_name(disp_name)
+                            norm_slug = _normalize_name(slug)
+                            if norm_disp:
+                                scan_games_map[norm_disp] = sg
+                            if norm_slug:
+                                scan_games_map[norm_slug] = sg
                             if slug:
                                 scan_games_map[slug.lower()] = sg
 
@@ -742,7 +848,7 @@ class HoardBackend:
                 tracked: List[Dict[str, Any]] = []
                 missing_folder: List[Dict[str, Any]] = []
 
-                seen_tracked_slugs: set = set()
+                seen_scan_slugs: set = set()
 
                 for sg in steam_games:
                     name = sg["name"]
@@ -750,6 +856,20 @@ class HoardBackend:
                     norm = _normalize_name(name)
 
                     scan_entry = scan_games_map.get(norm)
+                    if not scan_entry and len(norm) >= 5:
+                        # Fallback match when Steam adds edition suffixes or punctuation differences
+                        candidates = [
+                            entry
+                            for entry in scanned_entries
+                            if entry.get("slug", "").lower() not in seen_scan_slugs
+                            and (
+                                norm in _normalize_name(entry.get("display_name", ""))
+                                or _normalize_name(entry.get("display_name", "")) in norm
+                            )
+                            and len(_normalize_name(entry.get("display_name", ""))) >= 5
+                        ]
+                        if len(candidates) == 1:
+                            scan_entry = candidates[0]
 
                     is_tracked = False
                     slug = None
@@ -763,7 +883,11 @@ class HoardBackend:
                         paths = scan_entry.get("paths", [])
 
                     if not is_tracked:
-                        if (slug and slug.lower() in tracked_slugs) or norm in tracked_names:
+                        if (
+                            (slug and slug.lower() in tracked_slugs)
+                            or norm in tracked_names
+                            or any(p in tracked_paths for p in paths)
+                        ):
                             is_tracked = True
 
                     item = {
@@ -776,7 +900,7 @@ class HoardBackend:
                     }
 
                     if slug:
-                        seen_tracked_slugs.add(slug.lower())
+                        seen_scan_slugs.add(slug.lower())
 
                     if is_tracked:
                         tracked.append(item)
@@ -787,22 +911,54 @@ class HoardBackend:
                     else:
                         other_games.append(item)
 
-                # Include any scanned games that are already tracked but weren't in Steam manifests
-                for norm, sg in scan_games_map.items():
+                # Include any remaining scanned games from `hoard scan --json` (tracked, ready, or missing folder)
+                for sg in scanned_entries:
                     slug = sg.get("slug")
-                    if not slug or slug.lower() in seen_tracked_slugs:
+                    if not slug or slug.lower() in seen_scan_slugs:
                         continue
-                    is_tracked = bool(sg.get("tracked")) or (slug.lower() in tracked_slugs)
+                    seen_scan_slugs.add(slug.lower())
+
+                    disp_name = sg.get("display_name") or slug
+                    paths = sg.get("paths", [])
+                    needs_folder = bool(sg.get("needs_folder"))
+                    is_tracked = (
+                        bool(sg.get("tracked"))
+                        or (slug.lower() in tracked_slugs)
+                        or (_normalize_name(disp_name) in tracked_names)
+                        or any(p in tracked_paths for p in paths)
+                    )
+
+                    item = {
+                        "name": disp_name,
+                        "appid": None,
+                        "slug": slug,
+                        "needs_folder": needs_folder,
+                        "paths": paths,
+                        "tracked": is_tracked,
+                    }
+
                     if is_tracked:
-                        seen_tracked_slugs.add(slug.lower())
-                        tracked.append({
-                            "name": sg.get("display_name", slug),
-                            "appid": None,
-                            "slug": slug,
-                            "needs_folder": bool(sg.get("needs_folder")),
-                            "paths": sg.get("paths", []),
-                            "tracked": True,
-                        })
+                        tracked.append(item)
+                    elif needs_folder:
+                        missing_folder.append(item)
+                    else:
+                        ready_to_track.append(item)
+
+                # Include any tracked saves from `hoard saves --json` not yet represented
+                for s in saves_list:
+                    g_slug = str(s.get("game_slug") or s.get("slug") or "").strip()
+                    if not g_slug or g_slug.lower() in seen_scan_slugs:
+                        continue
+                    seen_scan_slugs.add(g_slug.lower())
+                    l_path = str(s.get("local_path") or "").strip()
+                    tracked.append({
+                        "name": str(s.get("game_name") or g_slug),
+                        "appid": None,
+                        "slug": g_slug,
+                        "needs_folder": False,
+                        "paths": [l_path] if l_path else [],
+                        "tracked": True,
+                    })
 
                 ready_to_track.sort(key=lambda x: x["name"].lower())
                 other_games.sort(key=lambda x: x["name"].lower())
