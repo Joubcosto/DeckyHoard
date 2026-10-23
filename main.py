@@ -1,17 +1,12 @@
 import asyncio
-import hashlib
 import json
 import logging
 import os
 import pwd
 import re
-import shlex
 import shutil
-import tempfile
-import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
-# Attempt import of decky (available when running inside Decky Loader)
 try:
     import decky
 except ImportError:
@@ -23,126 +18,73 @@ else:
     logger = logging.getLogger("decky-hoard")
     logger.setLevel(logging.INFO)
 
-# Known Steam tool / runtime AppIDs to exclude from game list
-EXCLUDED_APPIDS = {
-    "228980",   # Steamworks Common Redistributables
-    "1070560",  # Steam Linux Runtime
-    "1391110",  # Steam Linux Runtime - Soldier
-    "1628350",  # Steam Linux Runtime - Sniper
-    "1826330",  # Steam Linux Runtime - Medic
-    "221410",   # Steam Controller Configs
-    "250820",   # SteamVR
-    "896660",   # Proton 4.11
-    "1245040",  # Proton 5.0
-    "1420170",  # Proton 5.13
-    "1580130",  # Proton 6.3
-    "1887720",  # Proton 7.0
-    "2348520",  # Proton 8.0
-    "3089140",  # Proton 9.0
-    "1493710",  # Proton Experimental
-    "2180100",  # Proton Hotfix
-}
-
-# Prefix patterns for tools/runtimes to ignore
-EXCLUDED_NAME_PATTERNS = [
-    re.compile(r"^proton", re.IGNORECASE),
-    re.compile(r"^steam linux runtime", re.IGNORECASE),
-    re.compile(r"^steamworks common", re.IGNORECASE),
-    re.compile(r"^steamvr", re.IGNORECASE),
-    re.compile(r"^steam controller", re.IGNORECASE),
-]
-
-
-def _normalize_name(name: str) -> str:
-    """Normalize game name for fuzzy comparison (remove punctuation, lower)."""
-    return re.sub(r"[^a-z0-9]", "", name.lower())
-
 
 def _get_decky_user_info() -> Tuple[str, int, int, str]:
-    """
-    Determine target non-root user (name, uid, gid, home) for running Hoard.
-    On SteamOS this is typically 'deck', on Bazzite the main user.
-    """
-    user_name: Optional[str] = None
-    user_home: Optional[str] = None
-
-    if decky:
-        user_name = getattr(decky, "DECKY_USER", None)
-        user_home = getattr(decky, "DECKY_USER_HOME", None)
+    """Resolve the non-root SteamOS / Bazzite user (name, uid, gid, home)."""
+    user_name: Optional[str] = getattr(decky, "DECKY_USER", None) if decky else None
+    user_home: Optional[str] = getattr(decky, "DECKY_USER_HOME", None) if decky else None
 
     if not user_name or user_name == "root":
         user_name = os.environ.get("DECKY_USER") or os.environ.get("SUDO_USER")
 
-    # Extract username from plugin path (/home/<user>/... or /var/home/<user>/...)
     if not user_name or user_name == "root":
-        abs_path = os.path.abspath(__file__)
-        m = re.match(r"^/var/home/([^/]+)|^/home/([^/]+)", abs_path)
+        m = re.match(r"^/var/home/([^/]+)|^/home/([^/]+)", os.path.abspath(__file__))
         if m:
             candidate = m.group(1) or m.group(2)
             try:
-                entry = pwd.getpwnam(candidate)
-                if entry.pw_uid >= 1000:
-                    user_name = entry.pw_name
-                    user_home = entry.pw_dir
+                if pwd.getpwnam(candidate).pw_uid >= 1000:
+                    user_name = candidate
             except KeyError:
                 pass
 
-    # If still root or unset, look for 'deck' user or first UID >= 1000 with a home dir
     if not user_name or user_name == "root":
         try:
-            deck_entry = pwd.getpwnam("deck")
-            user_name = deck_entry.pw_name
-            user_home = deck_entry.pw_dir
+            user_name = pwd.getpwnam("deck").pw_name
         except KeyError:
             for entry in pwd.getpwall():
-                if entry.pw_uid >= 1000 and os.path.exists(entry.pw_dir) and "home" in entry.pw_dir:
+                if entry.pw_uid >= 1000 and "home" in entry.pw_dir:
                     user_name = entry.pw_name
-                    user_home = entry.pw_dir
                     break
 
-    # Fallback to current process owner
-    if not user_name:
-        entry = pwd.getpwuid(os.getuid())
-        user_name = entry.pw_name
-        user_home = entry.pw_dir
-
-    entry = pwd.getpwnam(user_name)
-    user_uid = entry.pw_uid
-    user_gid = entry.pw_gid
+    entry = pwd.getpwnam(user_name) if user_name else pwd.getpwuid(os.getuid())
     if not user_home or user_home == "/root":
         user_home = entry.pw_dir
 
-    return user_name, user_uid, user_gid, user_home
+    return entry.pw_name, entry.pw_uid, entry.pw_gid, user_home
 
 
 def _get_user_env(user_name: str, user_uid: int, user_home: str) -> Dict[str, str]:
-    """Prepare environment variables needed by Hoard and systemd --user."""
+    """
+    Build a clean environment for the target user.
+    Strips Decky Loader's PyInstaller LD_LIBRARY_PATH / LD_PRELOAD so native
+    system binaries (hoard, systemctl, curl) use host libraries properly.
+    """
     runtime_dir = f"/run/user/{user_uid}"
-    bus_path = f"unix:path={runtime_dir}/bus"
     real_home = os.path.realpath(user_home)
 
     env = dict(os.environ)
-    env["USER"] = user_name
-    env["LOGNAME"] = user_name
-    env["HOME"] = user_home
-    env["SHELL"] = "/bin/bash"
-    env["XDG_CONFIG_HOME"] = os.path.join(user_home, ".config")
-    env["XDG_DATA_HOME"] = os.path.join(user_home, ".local", "share")
-    env["XDG_STATE_HOME"] = os.path.join(user_home, ".local", "state")
-    env["XDG_CACHE_HOME"] = os.path.join(user_home, ".cache")
-    env["XDG_RUNTIME_DIR"] = runtime_dir
-    env["DBUS_SESSION_BUS_ADDRESS"] = bus_path
-    bin_path = f"{user_home}/.local/bin:{real_home}/.local/bin"
-    env["PATH"] = f"{bin_path}:/usr/local/bin:/usr/bin:/bin:{env.get('PATH', '')}"
+    env.pop("LD_LIBRARY_PATH", None)
+    env.pop("LD_PRELOAD", None)
+
+    env.update({
+        "USER": user_name,
+        "LOGNAME": user_name,
+        "HOME": user_home,
+        "XDG_CONFIG_HOME": os.path.join(user_home, ".config"),
+        "XDG_DATA_HOME": os.path.join(user_home, ".local", "share"),
+        "XDG_STATE_HOME": os.path.join(user_home, ".local", "state"),
+        "XDG_CACHE_HOME": os.path.join(user_home, ".cache"),
+        "XDG_RUNTIME_DIR": runtime_dir,
+        "DBUS_SESSION_BUS_ADDRESS": f"unix:path={runtime_dir}/bus",
+        "NO_COLOR": "1",
+        "HOARD_NONINTERACTIVE": "1",
+        "PATH": f"{user_home}/.local/bin:{real_home}/.local/bin:/usr/local/bin:/usr/bin:/bin",
+    })
     return env
 
 
 class HoardBackend:
-    """
-    Actual stateful backend instance.
-    Decky Loader calls methods on the `Plugin` class directly without calling `Plugin.__init__()`,
-    so delegating to a singleton `HoardBackend` instance ensures state and bound methods work properly.
-    """
+    """Minimal CLI wrapper around `hoard` using its native `--json` contract."""
 
     def __init__(self):
         self._lock: Optional[asyncio.Lock] = None
@@ -151,9 +93,7 @@ class HoardBackend:
         self._hoard_bin = os.path.join(self._user_home, ".local", "bin", "hoard")
         self._cached_games: Optional[Dict[str, Any]] = None
         self._is_scanning = False
-        logger.info(
-            f"Initialized HoardBackend for user={self._user_name} (uid={self._user_uid}, home={self._user_home}), bin={self._hoard_bin}"
-        )
+        logger.info(f"HoardBackend initialized for {self._user_name} ({self._user_home})")
 
     @property
     def lock(self) -> asyncio.Lock:
@@ -171,53 +111,14 @@ class HoardBackend:
         if os.path.isfile(self._hoard_bin) and os.access(self._hoard_bin, os.X_OK):
             return self._hoard_bin
         env = _get_user_env(self._user_name, self._user_uid, self._user_home)
-        found = shutil.which("hoard", path=env.get("PATH"))
+        found = shutil.which("hoard", path=env["PATH"])
         if found:
             self._hoard_bin = found
         return self._hoard_bin
 
-    def _has_local_session_config(self) -> bool:
-        """
-        Check if Hoard has local configuration / credentials / token files in the user's home directory.
-        """
-        candidate_dirs = [
-            os.path.join(self._user_home, ".config", "hoard"),
-            os.path.join(self._user_home, ".local", "share", "hoard"),
-            os.path.join(self._user_home, ".hoard"),
-        ]
-        auth_keywords = ("token", "session", "auth", "credential", "api_key", "server", "user", "email")
-
-        for d in candidate_dirs:
-            if not os.path.isdir(d):
-                continue
-            try:
-                for root, _, files in os.walk(d):
-                    for fname in files:
-                        fpath = os.path.join(root, fname)
-                        lower_name = fname.lower()
-                        if lower_name in ("credentials", "credentials.json", "credentials.toml", "session.json", "auth.json", "token"):
-                            if os.path.getsize(fpath) > 0:
-                                return True
-                        if lower_name.endswith((".toml", ".json", ".yaml", ".yml", ".conf")):
-                            try:
-                                with open(fpath, "r", encoding="utf-8", errors="ignore") as f:
-                                    content = f.read(16384).lower()
-                                if any(k in content for k in auth_keywords):
-                                    return True
-                            except Exception:
-                                pass
-            except Exception:
-                pass
-        return False
-
-    async def _run_hoard(self, *args: str, timeout: int = 60) -> Dict[str, Any]:
-        """
-        Execute `hoard <args>` via `/bin/bash -lc` as DECKY_USER with standard environment.
-        """
-        hoard_cmd = shlex.join(["hoard", *args])
-        cmd = ["/bin/bash", "-lc", hoard_cmd]
+    async def _exec(self, *cmd: str, timeout: int = 60) -> Dict[str, Any]:
+        """Run a subprocess directly as DECKY_USER without a login shell wrapper."""
         env = _get_user_env(self._user_name, self._user_uid, self._user_home)
-
         kwargs: Dict[str, Any] = {
             "stdin": asyncio.subprocess.DEVNULL,
             "stdout": asyncio.subprocess.PIPE,
@@ -225,7 +126,6 @@ class HoardBackend:
             "env": env,
             "cwd": self._user_home,
         }
-
         if os.geteuid() == 0:
             kwargs["user"] = self._user_uid
             kwargs["group"] = self._user_gid
@@ -233,68 +133,83 @@ class HoardBackend:
         try:
             proc = await asyncio.create_subprocess_exec(*cmd, **kwargs)
             stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            stdout_str = stdout_b.decode("utf-8", errors="replace").strip()
-            stderr_str = stderr_b.decode("utf-8", errors="replace").strip()
-            rc = proc.returncode
-
-            if rc == 127:
-                return {
-                    "ok": False,
-                    "returncode": rc,
-                    "error": "not_installed",
-                    "stdout": stdout_str,
-                    "stderr": stderr_str,
-                    "message": "Hoard command not found in /bin/bash PATH",
-                }
-
-            data = None
-            if stdout_str:
-                try:
-                    data = json.loads(stdout_str)
-                except Exception:
-                    brace_idx = stdout_str.find("{")
-                    if brace_idx != -1:
-                        try:
-                            data = json.loads(stdout_str[brace_idx:])
-                        except Exception:
-                            data = None
-
             return {
-                "ok": rc == 0,
-                "returncode": rc,
-                "stdout": stdout_str,
-                "stderr": stderr_str,
-                "data": data,
+                "ok": proc.returncode == 0,
+                "returncode": proc.returncode,
+                "stdout": stdout_b.decode("utf-8", errors="replace").strip(),
+                "stderr": stderr_b.decode("utf-8", errors="replace").strip(),
             }
         except asyncio.TimeoutError:
-            logger.error(f"Command timed out ({timeout}s): {hoard_cmd}")
-            return {
-                "ok": False,
-                "returncode": -2,
-                "error": "timeout",
-                "message": f"Command timed out after {timeout} seconds",
-            }
+            logger.error(f"Command timed out ({timeout}s): {cmd}")
+            return {"ok": False, "returncode": -2, "stdout": "", "stderr": f"Timed out after {timeout}s"}
+        except FileNotFoundError:
+            return {"ok": False, "returncode": 127, "stdout": "", "stderr": f"Binary not found: {cmd[0]}"}
         except Exception as e:
-            logger.exception(f"Error running Hoard command {hoard_cmd}: {e}")
-            return {
-                "ok": False,
-                "returncode": -3,
-                "error": "exception",
-                "message": str(e),
-            }
+            logger.exception(f"Subprocess error ({cmd}): {e}")
+            return {"ok": False, "returncode": -3, "stdout": "", "stderr": str(e)}
 
-    async def get_status(self) -> Dict[str, Any]:
+    async def _run_hoard(self, *args: str, timeout: int = 60) -> Dict[str, Any]:
         """
-        Check Hoard installation status, user session (login), and background sync service.
+        Execute `hoard <args>` and parse Hoard's JSON envelope when `--json` is used:
+        Success: {"ok": true, "data": ...}
+        Error:   {"ok": false, "error": {"code": "...", "message": "..."}}
         """
         hoard_bin = self._resolve_hoard_bin()
-        installed = os.path.isfile(hoard_bin) and os.access(hoard_bin, os.X_OK)
+        if not (os.path.isfile(hoard_bin) and os.access(hoard_bin, os.X_OK)):
+            return {
+                "ok": False,
+                "returncode": 127,
+                "error_code": "not_installed",
+                "message": "Hoard CLI is not installed",
+                "data": None,
+            }
 
-        # 1. Check version via /bin/bash -lc "hoard --version"
-        version_res = await self._run_hoard("--version", timeout=10)
-        if version_res["ok"]:
-            installed = True
-        if not installed:
+        res = await self._exec(hoard_bin, *args, timeout=timeout)
+        stdout = res["stdout"]
+        stderr = res["stderr"]
+        rc = res["returncode"]
+
+        envelope = None
+        if stdout.startswith("{"):
+            try:
+                envelope = json.loads(stdout)
+            except Exception:
+                pass
+
+        if isinstance(envelope, dict) and "ok" in envelope:
+            if envelope.get("ok"):
+                return {
+                    "ok": True,
+                    "returncode": rc,
+                    "data": envelope.get("data"),
+                    "stdout": stdout,
+                    "stderr": stderr,
+                }
+            err_obj = envelope.get("error") if isinstance(envelope.get("error"), dict) else {}
+            return {
+                "ok": False,
+                "returncode": rc,
+                "error_code": err_obj.get("code", "cli_error"),
+                "message": err_obj.get("message") or stderr or stdout,
+                "data": None,
+                "stdout": stdout,
+                "stderr": stderr,
+            }
+
+        return {
+            "ok": rc == 0,
+            "returncode": rc,
+            "error_code": None if rc == 0 else "cli_error",
+            "message": stderr or stdout,
+            "data": None,
+            "stdout": stdout,
+            "stderr": stderr,
+        }
+
+    async def get_status(self) -> Dict[str, Any]:
+        """Check CLI installation, background daemon status, and user session."""
+        hoard_bin = self._resolve_hoard_bin()
+        if not (os.path.isfile(hoard_bin) and os.access(hoard_bin, os.X_OK)):
             return {
                 "installed": False,
                 "version": None,
@@ -305,102 +220,28 @@ class HoardBackend:
                 "binary_path": hoard_bin,
             }
 
-        version = version_res.get("stdout") if version_res["ok"] else "Installed"
-
-        # 2. Check sync service via /bin/bash -lc "systemctl --user is-active hoard-sync.service"
-        service_running = False
-        try:
-            env = _get_user_env(self._user_name, self._user_uid, self._user_home)
-            cmd = ["/bin/bash", "-lc", "systemctl --user is-active hoard-sync.service"]
-            kwargs: Dict[str, Any] = {
-                "stdin": asyncio.subprocess.DEVNULL,
-                "stdout": asyncio.subprocess.PIPE,
-                "stderr": asyncio.subprocess.PIPE,
-                "env": env,
-                "cwd": self._user_home,
-            }
-            if os.geteuid() == 0:
-                kwargs["user"] = self._user_uid
-                kwargs["group"] = self._user_gid
-
-            proc = await asyncio.create_subprocess_exec(*cmd, **kwargs)
-            stdout_b, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            status_text = stdout_b.decode("utf-8", errors="replace").strip()
-            service_running = status_text == "active"
-        except Exception as e:
-            logger.warning(f"Error checking systemctl service: {e}")
-
-        sync_res = await self._run_hoard("sync", timeout=8)
-        stdout_sync = (sync_res.get("stdout") or "").lower()
-        stderr_sync = (sync_res.get("stderr") or "").lower()
-        if not service_running:
-            service_running = (
-                ("running" in stdout_sync and "not running" not in stdout_sync)
-                or ("active" in stdout_sync and "inactive" not in stdout_sync)
-            )
-
-        # 3. Check session / login state using multiple signals
-        logged_in = False
-        user_info = None
-        not_logged_phrases = (
-            "not logged in",
-            "no session",
-            "no_session",
-            "not authenticated",
-            "unauthenticated",
-            "please login",
-            "please log in",
-            "run 'hoard login'",
-            "run `hoard login`",
-        )
-        cli_error_phrases = (
-            "unexpected argument",
-            "unrecognized subcommand",
-            "invalid subcommand",
-            "unknown option",
-            "found argument",
+        ver_res, svc_res, whoami_res = await asyncio.gather(
+            self._run_hoard("--version", timeout=5),
+            self._exec("systemctl", "--user", "is-active", "hoard-sync.service", timeout=5),
+            self._run_hoard("whoami", "--json", timeout=10),
         )
 
-        # Signal A: Try `hoard whoami --json` then `hoard whoami`
-        whoami_res = await self._run_hoard("whoami", "--json", timeout=10)
-        combined_whoami = f"{whoami_res.get('stdout') or ''}\n{whoami_res.get('stderr') or ''}".lower()
-        if not whoami_res["ok"] and any(p in combined_whoami for p in cli_error_phrases):
-            whoami_res = await self._run_hoard("whoami", timeout=10)
-            combined_whoami = f"{whoami_res.get('stdout') or ''}\n{whoami_res.get('stderr') or ''}".lower()
+        version = ver_res["stdout"] if ver_res["ok"] else "Installed"
+        service_running = svc_res["ok"] and svc_res["stdout"] == "active"
 
-        explicitly_logged_out = False
-        if any(p in combined_whoami for p in not_logged_phrases):
-            explicitly_logged_out = True
-        elif isinstance(whoami_res.get("data"), dict):
-            raw_data = whoami_res["data"]
-            err_val = str(raw_data.get("error") or "").lower()
-            msg_val = str(raw_data.get("message") or "").lower()
-            if any(p in err_val or p in msg_val for p in not_logged_phrases):
-                explicitly_logged_out = True
-            elif raw_data.get("ok") is not False:
-                logged_in = True
-                user_info = raw_data.get("data", raw_data)
-        elif whoami_res["ok"]:
+        # Hoard CLI exit code 2 / error_code "no_session" or "unauthorized" means signed out.
+        # Exit code 6 ("network", "storage_unreachable") means signed in locally, but offline.
+        err_code = whoami_res.get("error_code")
+        rc = whoami_res.get("returncode")
+        if whoami_res["ok"]:
             logged_in = True
-            user_info = {"user": whoami_res.get("stdout")}
-
-        # Signal B: If sync daemon is active, or `hoard sync` succeeded without a login error, or local session config exists
-        if not logged_in and not explicitly_logged_out:
-            combined_sync = f"{stdout_sync}\n{stderr_sync}"
-            if service_running:
-                logged_in = True
-            elif sync_res["ok"] and not any(p in combined_sync for p in not_logged_phrases):
-                logged_in = True
-            elif self._has_local_session_config():
-                logged_in = True
-
-        # Signal C: Even if whoami failed (e.g. offline or self-hosted server), if local config + daemon are active, consider logged in
-        if not logged_in and (service_running or self._has_local_session_config()):
-            logged_in = True
-
-        logger.info(
-            f"Status check: installed={installed}, logged_in={logged_in}, service_running={service_running}"
-        )
+            user_info = whoami_res.get("data")
+        elif err_code in ("no_session", "unauthorized") or rc == 2:
+            logged_in = False
+            user_info = None
+        else:
+            logged_in = service_running or err_code in ("network", "storage_unreachable") or rc == 6
+            user_info = None
 
         return {
             "installed": True,
@@ -413,381 +254,103 @@ class HoardBackend:
         }
 
     async def install_hoard(self) -> Dict[str, Any]:
-        """
-        Download HoardSetup-x86_64, verify SHA256 checksum, and run with --silent as DECKY_USER.
-        """
+        """Install Hoard CLI in headless mode using the official installer script."""
         async with self.lock:
-            arch = os.uname().machine
-            if arch != "x86_64":
-                return {
-                    "ok": False,
-                    "error": "unsupported_arch",
-                    "message": f"Unsupported CPU architecture: {arch}",
-                }
+            script_url = "https://raw.githubusercontent.com/rleeon/hoard/main/web/static/install.sh"
+            cmd = f"curl -fsSL {script_url} | HOARD_HEADLESS=1 HOARD_NONINTERACTIVE=1 sh"
+            logger.info("Installing Hoard CLI via official install.sh (--headless)...")
+            res = await self._exec("/bin/sh", "-c", cmd, timeout=300)
 
-            base_url = "https://github.com/rleeon/hoard/releases/latest/download"
-            installer_name = f"HoardSetup-{arch}"
-            installer_url = f"{base_url}/{installer_name}"
-            checksum_url = f"{base_url}/{installer_name}.sha256"
+            hoard_bin = self._resolve_hoard_bin()
+            if res["ok"] and os.path.isfile(hoard_bin):
+                return {"ok": True, "message": "Hoard CLI installed successfully!"}
 
-            temp_dir = tempfile.mkdtemp(prefix="decky_hoard_install_")
-            installer_path = os.path.join(temp_dir, "HoardSetup")
-            try:
-                def _download_and_verify() -> Optional[Dict[str, Any]]:
-                    logger.info(f"Downloading HoardSetup from {installer_url}...")
-                    req = urllib.request.Request(installer_url, headers={"User-Agent": "decky-hoard"})
-                    with urllib.request.urlopen(req, timeout=120) as resp, open(installer_path, "wb") as f:
-                        shutil.copyfileobj(resp, f)
+            err_msg = res["stderr"] or res["stdout"] or "Installer exited with an error"
+            logger.error(f"Hoard install failed: {err_msg}")
+            return {"ok": False, "message": err_msg}
 
-                    expected_sha256 = None
-                    try:
-                        chk_req = urllib.request.Request(checksum_url, headers={"User-Agent": "decky-hoard"})
-                        with urllib.request.urlopen(chk_req, timeout=30) as resp:
-                            chk_text = resp.read().decode("utf-8").strip()
-                            expected_sha256 = chk_text.split()[0]
-                    except Exception as e:
-                        logger.warning(f"Failed to fetch .sha256 checksum file: {e}")
-
-                    if expected_sha256:
-                        hasher = hashlib.sha256()
-                        with open(installer_path, "rb") as f:
-                            while chunk := f.read(65536):
-                                hasher.update(chunk)
-                        actual_sha256 = hasher.hexdigest()
-                        if actual_sha256.lower() != expected_sha256.lower():
-                            return {
-                                "ok": False,
-                                "error": "checksum_mismatch",
-                                "message": f"SHA256 mismatch! Expected {expected_sha256}, got {actual_sha256}",
-                            }
-                        logger.info("HoardSetup checksum verified successfully.")
-                    return None
-
-                verify_err = await asyncio.to_thread(_download_and_verify)
-                if verify_err:
-                    return verify_err
-
-                os.chmod(installer_path, 0o755)
-                if os.geteuid() == 0:
-                    os.chown(installer_path, self._user_uid, self._user_gid)
-
-                env = _get_user_env(self._user_name, self._user_uid, self._user_home)
-                cmd = [installer_path, "--silent"]
-                kwargs: Dict[str, Any] = {
-                    "stdin": asyncio.subprocess.DEVNULL,
-                    "stdout": asyncio.subprocess.PIPE,
-                    "stderr": asyncio.subprocess.PIPE,
-                    "env": env,
-                    "cwd": self._user_home,
-                }
-                if os.geteuid() == 0:
-                    kwargs["user"] = self._user_uid
-                    kwargs["group"] = self._user_gid
-
-                logger.info("Executing HoardSetup --silent...")
-                proc = await asyncio.create_subprocess_exec(*cmd, **kwargs)
-                stdout_b, stderr_b = await asyncio.wait_for(proc.communicate(), timeout=300)
-                stdout_str = stdout_b.decode("utf-8", errors="replace").strip()
-                stderr_str = stderr_b.decode("utf-8", errors="replace").strip()
-
-                if proc.returncode != 0:
-                    logger.error(f"HoardSetup failed ({proc.returncode}): {stderr_str}")
-                    return {
-                        "ok": False,
-                        "error": "setup_failed",
-                        "message": f"HoardSetup failed with code {proc.returncode}: {stderr_str or stdout_str}",
-                    }
-
-                local_bin = os.path.join(self._user_home, ".local", "bin")
-                for bin_name in ["hoard", "hoardd"]:
-                    bp = os.path.join(local_bin, bin_name)
-                    if os.path.exists(bp):
-                        os.chmod(bp, 0o755)
-                        if os.geteuid() == 0:
-                            os.chown(bp, self._user_uid, self._user_gid)
-
-                hoard_bin = self._resolve_hoard_bin()
-                if os.path.isfile(hoard_bin):
-                    logger.info("Hoard successfully installed!")
-                    return {"ok": True, "message": "Hoard installed successfully!"}
-                else:
-                    return {
-                        "ok": False,
-                        "error": "binary_missing",
-                        "message": f"Installation finished but binary missing at {hoard_bin}",
-                    }
-
-            except Exception as e:
-                logger.exception(f"Exception during Hoard installation: {e}")
-                return {"ok": False, "error": "install_exception", "message": str(e)}
-            finally:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-
-    async def _get_tracked_saves_list(self) -> List[Dict[str, Any]]:
-        """
-        Query `hoard saves --json` and return the list of tracked save entries.
-        Each entry typically contains `save_id`, `game_slug`, `label`, `local_path`, etc.
-        """
-        saves_res = await self._run_hoard("saves", "--json", timeout=20)
-        if not (saves_res["ok"] and saves_res.get("data")):
+    async def _get_tracked_saves(self) -> List[Dict[str, Any]]:
+        """Read local tracked saves via `hoard saves --json` (offline & instant)."""
+        res = await self._run_hoard("saves", "--json", timeout=15)
+        if not res["ok"] or not isinstance(res.get("data"), dict):
             return []
-
-        raw_saves = saves_res["data"]
-        if isinstance(raw_saves, dict):
-            inner = raw_saves.get("data", raw_saves)
-            saves_list = (
-                inner.get("saves", [])
-                if isinstance(inner, dict)
-                else (inner if isinstance(inner, list) else [])
-            )
-        elif isinstance(raw_saves, list):
-            saves_list = raw_saves
-        else:
-            saves_list = []
-
-        return [s for s in saves_list if isinstance(s, dict)]
+        saves = res["data"].get("saves", [])
+        return [s for s in saves if isinstance(s, dict)]
 
     async def force_sync(self) -> Dict[str, Any]:
-        """
-        Synchronize saves: start or restart the background sync daemon hoardd,
-        and run `hoard backup <save_id>` for all tracked saves so changes are
-        immediately uploaded to the cloud/server.
-        """
+        """Ensure hoard-sync service is running and trigger backup for all active saves."""
         async with self.lock:
             status = await self.get_status()
-            if not status.get("installed"):
+            if not status["installed"]:
                 return {"ok": False, "message": "Hoard is not installed"}
 
-            if status.get("service_running"):
-                res = await self._run_hoard("sync", "restart", timeout=30)
-                action = "restarted"
-            else:
-                res = await self._run_hoard("sync", "start", timeout=30)
-                action = "started"
+            if not status["service_running"]:
+                await self._run_hoard("sync", "start", timeout=20)
 
-            # Upload all tracked saves immediately
-            saves_list = await self._get_tracked_saves_list()
+            saves = await self._get_tracked_saves()
+            active_saves = [s for s in saves if s.get("save_id") and not s.get("paused")]
+
             backed_up = 0
-            backup_errors: List[str] = []
-            for s in saves_list:
-                save_id = s.get("save_id")
-                if not save_id or s.get("paused"):
-                    continue
-                b_res = await self._run_hoard("backup", str(save_id), timeout=180)
+            errors: List[str] = []
+            for s in active_saves:
+                b_res = await self._run_hoard("backup", str(s["save_id"]), timeout=180)
                 if b_res["ok"]:
                     backed_up += 1
                 else:
-                    err = b_res.get("stderr") or b_res.get("stdout") or "Backup error"
-                    logger.warning(f"Backup failed for save_id={save_id}: {err}")
-                    backup_errors.append(err)
+                    errors.append(b_res.get("message") or "Backup failed")
 
-            if res["ok"] or backed_up > 0:
-                return {
-                    "ok": True,
-                    "message": f"Hoard sync daemon {action} ({backed_up} save(s) backed up).",
-                }
-            else:
-                err_msg = (
-                    (backup_errors[0] if backup_errors else None)
-                    or res.get("stderr")
-                    or res.get("stdout")
-                    or "Unknown error"
-                )
-                return {"ok": False, "message": f"Sync failed: {err_msg}"}
+            if errors and backed_up == 0:
+                return {"ok": False, "message": errors[0]}
+
+            return {
+                "ok": True,
+                "message": f"Synchronized {backed_up}/{len(active_saves)} tracked save(s).",
+            }
 
     async def track_game(self, game_name: str, slug: Optional[str] = None) -> Dict[str, Any]:
-        """
-        Track a game with Hoard CLI (`hoard track <game_name>`, with fallback to `--slug`),
-        then immediately trigger `hoard backup <save_id>` so the save is uploaded to the cloud.
-        """
+        """Track a detected game via `hoard track` and upload its first snapshot."""
         async with self.lock:
-            args = ["track", game_name]
-            logger.info(f"Tracking game with args: {args}")
+            args = ["track", "--slug", slug] if slug else ["track", game_name]
             res = await self._run_hoard(*args, timeout=120)
 
-            if not res["ok"] and slug:
-                fallback_args = ["track", "--slug", slug]
-                logger.info(f"Fallback tracking game with args: {fallback_args}")
-                res = await self._run_hoard(*fallback_args, timeout=120)
+            if not res["ok"]:
+                return {"ok": False, "message": res.get("message") or f"Could not track {game_name}"}
 
+            # Extract save_id from `hoard track` output or `hoard saves --json`
+            m = re.search(r"save_id:\s*([0-9a-fA-F-]{36}|\S+)", res.get("stdout", ""))
+            save_id = m.group(1).strip() if m else None
+
+            if not save_id and slug:
+                for s in await self._get_tracked_saves():
+                    if s.get("game_slug") == slug:
+                        save_id = s.get("save_id")
+                        break
+
+            if save_id:
+                await self._run_hoard("backup", str(save_id), timeout=180)
+
+            self._cached_games = None
+            return {
+                "ok": True,
+                "message": f"'{game_name}' is now tracked!",
+                "slug": slug,
+                "save_id": save_id,
+            }
+
+    async def untrack_game(self, save_id: str) -> Dict[str, Any]:
+        """Stop watching a save folder locally while keeping cloud snapshots intact."""
+        async with self.lock:
+            res = await self._run_hoard("save", "untrack", save_id, "--json", timeout=30)
             if res["ok"]:
-                stdout_text = res.get("stdout") or ""
-
-                # Extract resolved slug and save_id from `hoard track` output if present:
-                #   tracking <display_name> (<slug>)
-                #     path:    <path>
-                #     save_id: <uuid>
-                resolved_slug = slug
-                slug_match = re.search(r"^tracking\s+.+\(([^)]+)\)", stdout_text, re.MULTILINE)
-                if slug_match:
-                    resolved_slug = slug_match.group(1).strip()
-
-                save_id: Optional[str] = None
-                save_id_match = re.search(r"save_id:\s*([0-9a-fA-F-]{36}|\S+)", stdout_text)
-                if save_id_match:
-                    save_id = save_id_match.group(1).strip()
-
-                # Fallback: look up save_id via `hoard saves --json`
-                if not save_id:
-                    saves_list = await self._get_tracked_saves_list()
-                    target_norms = {
-                        _normalize_name(game_name),
-                        _normalize_name(resolved_slug or ""),
-                        _normalize_name(slug or ""),
-                    } - {""}
-                    for s in saves_list:
-                        s_slug = str(s.get("game_slug") or s.get("slug") or "")
-                        if _normalize_name(s_slug) in target_norms:
-                            save_id = str(s.get("save_id") or "") or None
-                            if not resolved_slug and s_slug:
-                                resolved_slug = s_slug
-                            break
-
-                # Immediately upload the first snapshot to Cloud / Server
-                if save_id:
-                    logger.info(f"Uploading initial backup for '{game_name}' (save_id={save_id})...")
-                    backup_res = await self._run_hoard("backup", save_id, timeout=180)
-                    if not backup_res["ok"]:
-                        b_err = backup_res.get("stderr") or backup_res.get("stdout") or "Unknown backup error"
-                        logger.warning(f"Initial backup failed for {game_name} ({save_id}): {b_err}")
-
-                if self._cached_games:
-                    norm_target = _normalize_name(resolved_slug or slug or game_name)
-                    for category in ["ready_to_track", "other_games"]:
-                        for game in list(self._cached_games.get(category, [])):
-                            game_norm = _normalize_name(game.get("slug") or game.get("name", ""))
-                            if game_norm == norm_target or _normalize_name(game.get("name", "")) == _normalize_name(game_name):
-                                game["tracked"] = True
-                                if resolved_slug and not game.get("slug"):
-                                    game["slug"] = resolved_slug
-                                self._cached_games[category].remove(game)
-                                self._cached_games["tracked"].append(game)
-                                break
-                    self._update_cached_summary()
-
-                return {
-                    "ok": True,
-                    "message": f"Game '{game_name}' is now being tracked by Hoard!",
-                    "slug": resolved_slug,
-                    "save_id": save_id,
-                }
-            else:
-                err_msg = res.get("stderr") or res.get("stdout") or "Tracking failed"
-                logger.warning(f"Track failed for {game_name}: {err_msg}")
-                return {"ok": False, "message": f"Could not track '{game_name}': {err_msg}"}
-
-    def _update_cached_summary(self):
-        if not self._cached_games:
-            return
-        ready = len(self._cached_games.get("ready_to_track", []))
-        other = len(self._cached_games.get("other_games", []))
-        tracked = len(self._cached_games.get("tracked", []))
-        missing = len(self._cached_games.get("missing_folder", []))
-        self._cached_games["summary"] = {
-            "total": ready + other + tracked + missing,
-            "ready_count": ready,
-            "other_count": other,
-            "tracked_count": tracked,
-            "missing_count": missing,
-        }
-
-    def _find_steam_libraries(self) -> List[str]:
-        """Locate all Steam library folders (SSD + SD cards)."""
-        candidate_roots = [
-            os.path.join(self._user_home, ".local", "share", "Steam"),
-            os.path.join(self._user_home, ".steam", "steam"),
-            os.path.join(self._user_home, ".steam", "root"),
-            os.path.join(
-                self._user_home,
-                ".var",
-                "app",
-                "com.valvesoftware.Steam",
-                ".local",
-                "share",
-                "Steam",
-            ),
-        ]
-
-        found_libraries: set = set()
-        for root in candidate_roots:
-            if not os.path.isdir(root):
-                continue
-            resolved = os.path.realpath(root)
-            found_libraries.add(resolved)
-
-            vdf_path = os.path.join(resolved, "steamapps", "libraryfolders.vdf")
-            if os.path.isfile(vdf_path):
-                try:
-                    with open(vdf_path, "r", encoding="utf-8", errors="replace") as f:
-                        content = f.read()
-                    matches = re.findall(r'"path"\s+"([^"]+)"', content)
-                    for path in matches:
-                        if os.path.isdir(path):
-                            found_libraries.add(os.path.realpath(path))
-                except Exception as e:
-                    logger.warning(f"Error reading {vdf_path}: {e}")
-
-        return list(found_libraries)
-
-    def _scan_steam_installed_games(self) -> List[Dict[str, Any]]:
-        """Parse appmanifest_*.acf files across all discovered Steam libraries."""
-        libraries = self._find_steam_libraries()
-        games: List[Dict[str, Any]] = []
-        seen_appids: set = set()
-
-        for lib in libraries:
-            steamapps = os.path.join(lib, "steamapps")
-            if not os.path.isdir(steamapps):
-                continue
-
-            try:
-                for entry in os.scandir(steamapps):
-                    if not (entry.is_file() and entry.name.startswith("appmanifest_") and entry.name.endswith(".acf")):
-                        continue
-
-                    try:
-                        with open(entry.path, "r", encoding="utf-8", errors="replace") as f:
-                            text = f.read()
-
-                        appid_match = re.search(r'"appid"\s+"([^"]+)"', text)
-                        name_match = re.search(r'"name"\s+"([^"]+)"', text)
-                        if not appid_match or not name_match:
-                            continue
-
-                        appid = appid_match.group(1).strip()
-                        name = name_match.group(1).strip()
-
-                        if appid in seen_appids or appid in EXCLUDED_APPIDS:
-                            continue
-
-                        if any(pattern.search(name) for pattern in EXCLUDED_NAME_PATTERNS):
-                            continue
-
-                        seen_appids.add(appid)
-                        games.append({
-                            "appid": appid,
-                            "name": name,
-                            "library": lib,
-                        })
-                    except Exception as e:
-                        logger.debug(f"Error parsing {entry.name}: {e}")
-            except Exception as e:
-                logger.warning(f"Error scanning steamapps in {lib}: {e}")
-
-        games.sort(key=lambda g: g["name"].lower())
-        return games
+                self._cached_games = None
+                return {"ok": True, "message": "Game untracked locally (cloud backups kept)."}
+            return {"ok": False, "message": res.get("message") or "Failed to untrack game"}
 
     async def get_games(self, force_refresh: bool = False) -> Dict[str, Any]:
         """
-        Hybrid game discovery:
-        1. Parse local Steam VDF/ACF manifests (installed Steam games).
-        2. Query `hoard scan --json` (detected save locations, slugs, confidence, needs_folder).
-        3. Query `hoard saves --json` (already tracked saves).
-        4. Match and categorize into 4 ordered groups:
-           - ready_to_track
-           - other_games
-           - tracked
-           - missing_folder
+        Discover games exclusively through Hoard's native commands:
+        - `hoard saves --json` (local tracked saves with save_id & version info)
+        - `hoard scan --json`  (local Steam / Proton / Ludusavi detection)
         """
         async with self.scan_lock:
             if self._cached_games and not force_refresh:
@@ -795,143 +358,53 @@ class HoardBackend:
 
             self._is_scanning = True
             try:
-                # 1. Parse Steam manifests
-                steam_games = self._scan_steam_installed_games()
+                saves_list, scan_res = await asyncio.gather(
+                    self._get_tracked_saves(),
+                    self._run_hoard("scan", "--json", timeout=180),
+                )
 
-                # 2. Query hoard saves (tracked saves)
-                tracked_slugs: set = set()
-                tracked_names: set = set()
-                tracked_paths: set = set()
-                saves_list = await self._get_tracked_saves_list()
+                saves_by_slug: Dict[str, Dict[str, Any]] = {}
+                saves_by_path: Dict[str, Dict[str, Any]] = {}
                 for s in saves_list:
-                    g_slug = str(s.get("game_slug") or s.get("slug") or "").strip()
-                    if g_slug:
-                        tracked_slugs.add(g_slug.lower())
-                        tracked_names.add(_normalize_name(g_slug))
-                    g_name = str(s.get("game_name") or "").strip()
-                    if g_name:
-                        tracked_names.add(_normalize_name(g_name))
+                    g_slug = str(s.get("game_slug") or "").strip()
                     l_path = str(s.get("local_path") or "").strip()
+                    if g_slug:
+                        saves_by_slug[g_slug] = s
                     if l_path:
-                        tracked_paths.add(l_path)
+                        saves_by_path[l_path] = s
 
-                # 3. Query hoard scan --json
-                scan_games_map: Dict[str, Dict[str, Any]] = {}
-                scanned_entries: List[Dict[str, Any]] = []
-                scan_res = await self._run_hoard("scan", "--json", timeout=180)
-                if scan_res["ok"] and scan_res.get("data"):
-                    raw_scan = scan_res["data"]
-                    if isinstance(raw_scan, dict):
-                        inner = raw_scan.get("data", raw_scan)
-                        scanned_list = inner.get("games", []) if isinstance(inner, dict) else (inner if isinstance(inner, list) else [])
-                    elif isinstance(raw_scan, list):
-                        scanned_list = raw_scan
-                    else:
-                        scanned_list = []
-
-                    for sg in scanned_list:
-                        if isinstance(sg, dict):
-                            scanned_entries.append(sg)
-                            slug = sg.get("slug", "")
-                            disp_name = sg.get("display_name", "")
-                            norm_disp = _normalize_name(disp_name)
-                            norm_slug = _normalize_name(slug)
-                            if norm_disp:
-                                scan_games_map[norm_disp] = sg
-                            if norm_slug:
-                                scan_games_map[norm_slug] = sg
-                            if slug:
-                                scan_games_map[slug.lower()] = sg
+                scan_games: List[Dict[str, Any]] = []
+                if scan_res["ok"] and isinstance(scan_res.get("data"), dict):
+                    raw_games = scan_res["data"].get("games") or []
+                    scan_games = [g for g in raw_games if isinstance(g, dict)]
 
                 ready_to_track: List[Dict[str, Any]] = []
-                other_games: List[Dict[str, Any]] = []
                 tracked: List[Dict[str, Any]] = []
                 missing_folder: List[Dict[str, Any]] = []
+                seen_slugs: set = set()
 
-                seen_scan_slugs: set = set()
+                for g in scan_games:
+                    slug = str(g.get("slug") or "").strip()
+                    if not slug:
+                        continue
+                    seen_slugs.add(slug)
 
-                for sg in steam_games:
-                    name = sg["name"]
-                    appid = sg["appid"]
-                    norm = _normalize_name(name)
+                    name = str(g.get("display_name") or slug)
+                    paths = g.get("paths") if isinstance(g.get("paths"), list) else []
+                    needs_folder = bool(g.get("needs_folder"))
 
-                    scan_entry = scan_games_map.get(norm)
-                    if not scan_entry and len(norm) >= 5:
-                        # Fallback match when Steam adds edition suffixes or punctuation differences
-                        candidates = [
-                            entry
-                            for entry in scanned_entries
-                            if entry.get("slug", "").lower() not in seen_scan_slugs
-                            and (
-                                norm in _normalize_name(entry.get("display_name", ""))
-                                or _normalize_name(entry.get("display_name", "")) in norm
-                            )
-                            and len(_normalize_name(entry.get("display_name", ""))) >= 5
-                        ]
-                        if len(candidates) == 1:
-                            scan_entry = candidates[0]
-
-                    is_tracked = False
-                    slug = None
-                    needs_folder = False
-                    paths = []
-
-                    if scan_entry:
-                        slug = scan_entry.get("slug")
-                        is_tracked = bool(scan_entry.get("tracked"))
-                        needs_folder = bool(scan_entry.get("needs_folder"))
-                        paths = scan_entry.get("paths", [])
-
-                    if not is_tracked:
-                        if (
-                            (slug and slug.lower() in tracked_slugs)
-                            or norm in tracked_names
-                            or any(p in tracked_paths for p in paths)
-                        ):
-                            is_tracked = True
+                    save_entry = saves_by_slug.get(slug) or next(
+                        (saves_by_path[p] for p in paths if p in saves_by_path), None
+                    )
+                    is_tracked = bool(g.get("tracked")) or (save_entry is not None)
 
                     item = {
                         "name": name,
-                        "appid": appid,
                         "slug": slug,
-                        "needs_folder": needs_folder,
-                        "paths": paths,
-                        "tracked": is_tracked,
-                    }
-
-                    if slug:
-                        seen_scan_slugs.add(slug.lower())
-
-                    if is_tracked:
-                        tracked.append(item)
-                    elif needs_folder:
-                        missing_folder.append(item)
-                    elif scan_entry:
-                        ready_to_track.append(item)
-                    else:
-                        other_games.append(item)
-
-                # Include any remaining scanned games from `hoard scan --json` (tracked, ready, or missing folder)
-                for sg in scanned_entries:
-                    slug = sg.get("slug")
-                    if not slug or slug.lower() in seen_scan_slugs:
-                        continue
-                    seen_scan_slugs.add(slug.lower())
-
-                    disp_name = sg.get("display_name") or slug
-                    paths = sg.get("paths", [])
-                    needs_folder = bool(sg.get("needs_folder"))
-                    is_tracked = (
-                        bool(sg.get("tracked"))
-                        or (slug.lower() in tracked_slugs)
-                        or (_normalize_name(disp_name) in tracked_names)
-                        or any(p in tracked_paths for p in paths)
-                    )
-
-                    item = {
-                        "name": disp_name,
-                        "appid": None,
-                        "slug": slug,
+                        "save_id": save_entry.get("save_id") if save_entry else None,
+                        "paused": bool(save_entry.get("paused")) if save_entry else False,
+                        "last_version_num": save_entry.get("last_version_num") if save_entry else None,
+                        "last_backup_at": save_entry.get("last_backup_at") if save_entry else None,
                         "needs_folder": needs_folder,
                         "paths": paths,
                         "tracked": is_tracked,
@@ -944,41 +417,40 @@ class HoardBackend:
                     else:
                         ready_to_track.append(item)
 
-                # Include any tracked saves from `hoard saves --json` not yet represented
+                # Include any tracked saves from `hoard saves --json` not returned by `hoard scan`
                 for s in saves_list:
-                    g_slug = str(s.get("game_slug") or s.get("slug") or "").strip()
-                    if not g_slug or g_slug.lower() in seen_scan_slugs:
+                    slug = str(s.get("game_slug") or "").strip()
+                    if not slug or slug in seen_slugs:
                         continue
-                    seen_scan_slugs.add(g_slug.lower())
+                    seen_slugs.add(slug)
                     l_path = str(s.get("local_path") or "").strip()
                     tracked.append({
-                        "name": str(s.get("game_name") or g_slug),
-                        "appid": None,
-                        "slug": g_slug,
+                        "name": slug,
+                        "slug": slug,
+                        "save_id": s.get("save_id"),
+                        "paused": bool(s.get("paused")),
+                        "last_version_num": s.get("last_version_num"),
+                        "last_backup_at": s.get("last_backup_at"),
                         "needs_folder": False,
                         "paths": [l_path] if l_path else [],
                         "tracked": True,
                     })
 
                 ready_to_track.sort(key=lambda x: x["name"].lower())
-                other_games.sort(key=lambda x: x["name"].lower())
                 tracked.sort(key=lambda x: x["name"].lower())
                 missing_folder.sort(key=lambda x: x["name"].lower())
 
                 result = {
                     "ready_to_track": ready_to_track,
-                    "other_games": other_games,
                     "tracked": tracked,
                     "missing_folder": missing_folder,
                     "summary": {
-                        "total": len(ready_to_track) + len(other_games) + len(tracked) + len(missing_folder),
+                        "total": len(ready_to_track) + len(tracked) + len(missing_folder),
                         "ready_count": len(ready_to_track),
-                        "other_count": len(other_games),
                         "tracked_count": len(tracked),
                         "missing_count": len(missing_folder),
                     },
                 }
-
                 self._cached_games = result
                 return result
             finally:
@@ -998,8 +470,7 @@ def _get_backend() -> HoardBackend:
 class Plugin:
     async def _main(self):
         logger.info("Hoard plugin loaded.")
-        backend = _get_backend()
-        asyncio.create_task(backend.get_games(force_refresh=False))
+        asyncio.create_task(_get_backend().get_games(force_refresh=False))
 
     async def _unload(self):
         logger.info("Hoard plugin unloaded.")
@@ -1015,6 +486,9 @@ class Plugin:
 
     async def track_game(self, game_name: str, slug: Optional[str] = None) -> Dict[str, Any]:
         return await _get_backend().track_game(game_name, slug)
+
+    async def untrack_game(self, save_id: str) -> Dict[str, Any]:
+        return await _get_backend().untrack_game(save_id)
 
     async def get_games(self, force_refresh: bool = False) -> Dict[str, Any]:
         return await _get_backend().get_games(force_refresh)

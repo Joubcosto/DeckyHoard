@@ -6,15 +6,13 @@ Decky Loader plugin for [Hoard](https://github.com/rleeon/hoard) (game save back
 
 ## Features
 
-- **Automated CLI Setup**: One-click installation of the official `HoardSetup` binary with SHA-256 verification and proper unprivileged user permissions.
-- **Background Sync Management**: "Sync Now" button that detects daemon state and starts or restarts `hoardd` (`hoard-sync.service`), triggering immediate synchronization.
-- **Dynamic Steam Library Discovery**: Scans internal SSD and mounted MicroSD cards by parsing `libraryfolders.vdf` and `appmanifest_<appid>.acf`.
-- **Hybrid Matching**: Merges Steam games with `hoard scan --json` to detect exact slugs and save paths.
-- **One-Click Tracking**:
-  - **Ready to track**: Verified games tracked via `hoard track --slug <slug>`.
-  - **Other games**: Fallback for unlisted games via fuzzy search.
-  - **Tracked games**: Visual green badge confirming active synchronization.
-  - **Missing folders**: Collapsible section for games with no local save folder detected.
+- **Minimal Hoard CLI Wrapper**: Relies 100% on Hoard's native `--json` CLI contract (`hoard scan --json`, `hoard saves --json`, `hoard whoami --json`) with clean `LD_LIBRARY_PATH` isolation for Decky Loader.
+- **Headless CLI Setup**: One-click installation via Hoard's official `install.sh` (`HOARD_HEADLESS=1 HOARD_NONINTERACTIVE=1`).
+- **Background Sync Management**: "Sync Now" button that ensures `hoard-sync.service` is running and triggers `hoard backup <save_id>` across active tracked saves.
+- **One-Click Track & Untrack**:
+  - **Tracked games**: Displays version badge (`vN` / `SYNCED`) and supports one-click local untracking (`hoard save untrack <save_id> --json`).
+  - **Ready to track**: Games detected by `hoard scan --json` with valid save folders, tracked via `hoard track --slug <slug>`.
+  - **Missing folders**: Collapsible section for installed games with no local save folder yet (`needs_folder: true`).
 - **Game Mode UI**: Built with modern `@decky/api` (v1.x) and `@decky/ui` (v4.x), featuring bilingual FR/EN support matching the Steam client language and SteamOS toasts.
 
 ---

@@ -23,6 +23,7 @@ import {
   FaSyncAlt,
   FaCheckCircle,
   FaPlus,
+  FaTimes,
   FaExclamationTriangle,
   FaFolderMinus,
   FaDownload,
@@ -35,11 +36,19 @@ import {
 // Types
 // ==========================================
 
+interface HoardUserInfo {
+  kind?: "cloud" | "self_host";
+  email?: string;
+  plan?: string;
+  username?: string;
+  server?: string;
+}
+
 interface HoardStatus {
   installed: boolean;
   version: string | null;
   logged_in: boolean;
-  user_info: any;
+  user_info: HoardUserInfo | null;
   service_running: boolean;
   is_scanning: boolean;
   binary_path: string;
@@ -47,22 +56,23 @@ interface HoardStatus {
 
 interface GameItem {
   name: string;
-  appid: string | null;
-  slug: string | null;
+  slug: string;
+  save_id: string | null;
+  paused: boolean;
+  last_version_num: number | null;
+  last_backup_at: string | null;
   needs_folder: boolean;
-  paths?: string[];
+  paths: string[];
   tracked: boolean;
 }
 
 interface GamesData {
   ready_to_track: GameItem[];
-  other_games: GameItem[];
   tracked: GameItem[];
   missing_folder: GameItem[];
   summary: {
     total: number;
     ready_count: number;
-    other_count: number;
     tracked_count: number;
     missing_count: number;
   };
@@ -90,25 +100,24 @@ const STRINGS = {
     installSuccess: "Hoard installed successfully!",
     installFailed: "Installation failed: ",
     sessionRequiredTitle: "Sign-in Required",
-    sessionRequiredDesc: "Run 'hoard login' once in Desktop Mode to link your account or self-hosted server.",
+    sessionRequiredDesc: "Run 'hoard login' once in Desktop Mode to link your account or server.",
     syncSection: "Service & Sync",
     syncNow: "Sync Now",
     syncing: "Synchronizing...",
-    syncSuccess: "Saves synchronized successfully!",
+    syncSuccess: "Saves synchronized!",
     syncFailed: "Sync failed: ",
     refreshBtn: "Refresh Library",
     scanning: "Scanning games...",
     daemonActive: "Sync daemon active",
     daemonInactive: "Sync daemon stopped",
     readySection: "Ready to Track",
-    otherSection: "Other Installed Games",
     trackedSection: "Tracked Games",
     missingFolderSection: "Save Folder Missing",
-    missingFolderDesc: "Detected but no save folder was located on this device.",
-    trackBtn: "Track",
-    tracking: "Tracking...",
+    missingFolderDesc: "Installed but no save folder located on this device yet.",
     trackSuccess: "now tracked!",
     trackFailed: "Could not track game: ",
+    untrackSuccess: "untracked locally.",
+    untrackFailed: "Could not untrack: ",
     emptyCategory: "No games in this section",
     collapse: "Collapse",
     expand: "Expand",
@@ -116,31 +125,30 @@ const STRINGS = {
   fr: {
     pluginTitle: "Hoard Sync",
     notInstalledTitle: "Hoard n'est pas installé",
-    notInstalledDesc: "La CLI Hoard est requise pour sauvegarder et synchroniser vos sauvegardes de jeux.",
+    notInstalledDesc: "La CLI Hoard est requise pour sauvegarder et synchroniser vos sauvegardes.",
     installBtn: "Installer Hoard CLI",
     installing: "Téléchargement & Installation...",
-    installSuccess: "Hoard a été installé avec succès !",
+    installSuccess: "Hoard installé avec succès !",
     installFailed: "Échec de l'installation : ",
     sessionRequiredTitle: "Connexion requise",
-    sessionRequiredDesc: "Lancez 'hoard login' une fois en Mode Bureau pour associer votre compte ou serveur.",
+    sessionRequiredDesc: "Lancez 'hoard login' une fois en Mode Bureau pour lier votre compte ou serveur.",
     syncSection: "Service & Synchronisation",
     syncNow: "Synchroniser maintenant",
     syncing: "Synchronisation...",
-    syncSuccess: "Sauvegardes synchronisées avec succès !",
+    syncSuccess: "Sauvegardes synchronisées !",
     syncFailed: "Échec de la synchronisation : ",
     refreshBtn: "Rafraîchir la bibliothèque",
     scanning: "Analyse des jeux...",
     daemonActive: "Démon de synchronisation actif",
     daemonInactive: "Démon de synchronisation arrêté",
     readySection: "Prêts à être suivis",
-    otherSection: "Autres jeux installés",
     trackedSection: "Jeux suivis",
     missingFolderSection: "Dossier de sauvegarde introuvable",
-    missingFolderDesc: "Détecté mais aucun dossier de sauvegarde trouvé sur cet appareil.",
-    trackBtn: "Suivre",
-    tracking: "Suivi en cours...",
+    missingFolderDesc: "Installé mais aucun dossier de sauvegarde trouvé sur cet appareil.",
     trackSuccess: "est maintenant suivi !",
     trackFailed: "Impossible de suivre le jeu : ",
+    untrackSuccess: "n'est plus suivi localement.",
+    untrackFailed: "Impossible d'arrêter le suivi : ",
     emptyCategory: "Aucun jeu dans cette section",
     collapse: "Réduire",
     expand: "Développer",
@@ -148,7 +156,7 @@ const STRINGS = {
 };
 
 // ==========================================
-// Badges and UI helpers
+// Badge UI Helper
 // ==========================================
 
 const Badge: FC<{ children: ReactNode; color?: "green" | "amber" | "blue" | "gray" }> = ({
@@ -193,6 +201,7 @@ const Badge: FC<{ children: ReactNode; color?: "green" | "amber" | "blue" | "gra
         color: current.text,
         border: `1px solid ${current.border}`,
         marginLeft: "6px",
+        flexShrink: 0,
       }}
     >
       {children}
@@ -214,17 +223,16 @@ const HoardContent: FC = () => {
   const [isLoadingGames, setIsLoadingGames] = useState<boolean>(false);
   const [isInstalling, setIsInstalling] = useState<boolean>(false);
   const [isSyncing, setIsSyncing] = useState<boolean>(false);
-  const [trackingGame, setTrackingGame] = useState<string | null>(null);
+  const [busyGame, setBusyGame] = useState<string | null>(null);
   const [showMissingFolder, setShowMissingFolder] = useState<boolean>(false);
 
-  // Load Status
   const fetchStatus = useCallback(async () => {
     try {
       setIsLoadingStatus(true);
       const res = await call<[], HoardStatus>("get_status");
       setStatus(res);
       return res;
-    } catch (e: any) {
+    } catch (e) {
       console.error("Failed to get Hoard status", e);
       return null;
     } finally {
@@ -232,141 +240,105 @@ const HoardContent: FC = () => {
     }
   }, []);
 
-  // Load Games
   const fetchGames = useCallback(async (forceRefresh = false) => {
     try {
       setIsLoadingGames(true);
       const res = await call<[boolean], GamesData>("get_games", forceRefresh);
       setGames(res);
-    } catch (e: any) {
+    } catch (e) {
       console.error("Failed to load games list", e);
     } finally {
       setIsLoadingGames(false);
     }
   }, []);
 
-  // Initial load
   useEffect(() => {
-    fetchStatus().then((currentStatus) => {
-      if (currentStatus?.installed) {
+    fetchStatus().then((s) => {
+      if (s?.installed) {
         fetchGames(false);
       }
     });
   }, [fetchStatus, fetchGames]);
 
-  // Install Hoard
   const handleInstall = async () => {
     setIsInstalling(true);
-    toaster.toast({
-      title: t.pluginTitle,
-      body: t.installing,
-      duration: 4000,
-    });
+    toaster.toast({ title: t.pluginTitle, body: t.installing, duration: 4000 });
 
     try {
       const res = await call<[], { ok: boolean; message: string }>("install_hoard");
       if (res.ok) {
-        toaster.toast({
-          title: t.pluginTitle,
-          body: t.installSuccess,
-          duration: 3000,
-        });
+        toaster.toast({ title: t.pluginTitle, body: t.installSuccess, duration: 3000 });
         await fetchStatus();
         fetchGames(true);
       } else {
-        toaster.toast({
-          title: t.pluginTitle,
-          body: `${t.installFailed} ${res.message}`,
-          duration: 5000,
-        });
+        toaster.toast({ title: t.pluginTitle, body: `${t.installFailed}${res.message}`, duration: 5000 });
       }
     } catch (err: any) {
-      toaster.toast({
-        title: t.pluginTitle,
-        body: `${t.installFailed} ${err?.message || err}`,
-        duration: 5000,
-      });
+      toaster.toast({ title: t.pluginTitle, body: `${t.installFailed}${err?.message || err}`, duration: 5000 });
     } finally {
       setIsInstalling(false);
     }
   };
 
-  // Sync Now
   const handleSyncNow = async () => {
     setIsSyncing(true);
-    toaster.toast({
-      title: t.pluginTitle,
-      body: t.syncing,
-      duration: 3000,
-    });
+    toaster.toast({ title: t.pluginTitle, body: t.syncing, duration: 3000 });
 
     try {
       const res = await call<[], { ok: boolean; message: string }>("force_sync");
       if (res.ok) {
-        toaster.toast({
-          title: t.pluginTitle,
-          body: t.syncSuccess,
-          duration: 3000,
-        });
+        toaster.toast({ title: t.pluginTitle, body: res.message || t.syncSuccess, duration: 3000 });
         fetchStatus();
+        fetchGames(true);
       } else {
-        toaster.toast({
-          title: t.pluginTitle,
-          body: `${t.syncFailed} ${res.message}`,
-          duration: 5000,
-        });
+        toaster.toast({ title: t.pluginTitle, body: `${t.syncFailed}${res.message}`, duration: 5000 });
       }
     } catch (err: any) {
-      toaster.toast({
-        title: t.pluginTitle,
-        body: `${t.syncFailed} ${err?.message || err}`,
-        duration: 5000,
-      });
+      toaster.toast({ title: t.pluginTitle, body: `${t.syncFailed}${err?.message || err}`, duration: 5000 });
     } finally {
       setIsSyncing(false);
     }
   };
 
-  // Track Game
   const handleTrack = async (game: GameItem) => {
-    const gameIdentifier = game.slug || game.name;
-    setTrackingGame(gameIdentifier);
-
+    setBusyGame(game.slug);
     try {
       const res = await call<[string, string | null], { ok: boolean; message: string }>(
         "track_game",
         game.name,
-        game.slug || null
+        game.slug
       );
-
       if (res.ok) {
-        toaster.toast({
-          title: t.pluginTitle,
-          body: `"${game.name}" ${t.trackSuccess}`,
-          duration: 3000,
-        });
-        fetchGames(false);
+        toaster.toast({ title: t.pluginTitle, body: `"${game.name}" ${t.trackSuccess}`, duration: 3000 });
+        fetchGames(true);
       } else {
-        toaster.toast({
-          title: t.pluginTitle,
-          body: `${t.trackFailed} ${res.message}`,
-          duration: 5000,
-        });
+        toaster.toast({ title: t.pluginTitle, body: `${t.trackFailed}${res.message}`, duration: 5000 });
       }
     } catch (err: any) {
-      toaster.toast({
-        title: t.pluginTitle,
-        body: `${t.trackFailed} ${err?.message || err}`,
-        duration: 5000,
-      });
+      toaster.toast({ title: t.pluginTitle, body: `${t.trackFailed}${err?.message || err}`, duration: 5000 });
     } finally {
-      setTrackingGame(null);
+      setBusyGame(null);
     }
   };
 
-  // ------------------------------------------
-  // Render: Loading status initial state
-  // ------------------------------------------
+  const handleUntrack = async (game: GameItem) => {
+    if (!game.save_id) return;
+    setBusyGame(game.slug);
+    try {
+      const res = await call<[string], { ok: boolean; message: string }>("untrack_game", game.save_id);
+      if (res.ok) {
+        toaster.toast({ title: t.pluginTitle, body: `"${game.name}" ${t.untrackSuccess}`, duration: 3000 });
+        fetchGames(true);
+      } else {
+        toaster.toast({ title: t.pluginTitle, body: `${t.untrackFailed}${res.message}`, duration: 5000 });
+      }
+    } catch (err: any) {
+      toaster.toast({ title: t.pluginTitle, body: `${t.untrackFailed}${err?.message || err}`, duration: 5000 });
+    } finally {
+      setBusyGame(null);
+    }
+  };
+
   if (isLoadingStatus && !status) {
     return (
       <PanelSection>
@@ -379,9 +351,6 @@ const HoardContent: FC = () => {
     );
   }
 
-  // ------------------------------------------
-  // Render: Hoard is NOT installed
-  // ------------------------------------------
   if (!status?.installed) {
     return (
       <PanelSection title={t.notInstalledTitle}>
@@ -404,11 +373,7 @@ const HoardContent: FC = () => {
         </PanelSectionRow>
 
         <PanelSectionRow>
-          <ButtonItem
-            layout="below"
-            onClick={handleInstall}
-            disabled={isInstalling}
-          >
+          <ButtonItem layout="below" onClick={handleInstall} disabled={isInstalling}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "8px" }}>
               {isInstalling ? <Spinner /> : <FaDownload />}
               <span>{isInstalling ? t.installing : t.installBtn}</span>
@@ -419,14 +384,13 @@ const HoardContent: FC = () => {
     );
   }
 
-  // ------------------------------------------
-  // Render: Hoard is installed
-  // ------------------------------------------
+  const accountLabel =
+    status.user_info?.email ||
+    (status.user_info?.username ? `${status.user_info.username}` : null);
+
   return (
     <>
-      {/* 1. Header / Status / Sync section */}
       <PanelSection title={t.syncSection}>
-        {/* Session warning banner if not logged in */}
         {!status.logged_in && (
           <PanelSectionRow>
             <div
@@ -449,7 +413,6 @@ const HoardContent: FC = () => {
           </PanelSectionRow>
         )}
 
-        {/* Daemon status info */}
         <PanelSectionRow>
           <div
             style={{
@@ -461,20 +424,20 @@ const HoardContent: FC = () => {
               fontSize: "13px",
             }}
           >
-            <span>{status.service_running ? t.daemonActive : t.daemonInactive}</span>
+            <div style={{ display: "flex", flexDirection: "column" }}>
+              <span>{status.service_running ? t.daemonActive : t.daemonInactive}</span>
+              {accountLabel && (
+                <span style={{ fontSize: "11px", color: "#888" }}>{accountLabel}</span>
+              )}
+            </div>
             <Badge color={status.service_running ? "green" : "gray"}>
               {status.service_running ? "ONLINE" : "OFFLINE"}
             </Badge>
           </div>
         </PanelSectionRow>
 
-        {/* Sync Now button */}
         <PanelSectionRow>
-          <ButtonItem
-            layout="below"
-            onClick={handleSyncNow}
-            disabled={isSyncing}
-          >
+          <ButtonItem layout="below" onClick={handleSyncNow} disabled={isSyncing}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "8px" }}>
               {isSyncing ? <Spinner /> : <FaSyncAlt />}
               <span>{isSyncing ? t.syncing : t.syncNow}</span>
@@ -482,13 +445,8 @@ const HoardContent: FC = () => {
           </ButtonItem>
         </PanelSectionRow>
 
-        {/* Refresh Games button */}
         <PanelSectionRow>
-          <ButtonItem
-            layout="below"
-            onClick={() => fetchGames(true)}
-            disabled={isLoadingGames}
-          >
+          <ButtonItem layout="below" onClick={() => fetchGames(true)} disabled={isLoadingGames}>
             <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "8px" }}>
               {isLoadingGames ? <Spinner /> : <FaGamepad />}
               <span>{isLoadingGames ? t.scanning : t.refreshBtn}</span>
@@ -497,7 +455,6 @@ const HoardContent: FC = () => {
         </PanelSectionRow>
       </PanelSection>
 
-      {/* Loading games spinner */}
       {isLoadingGames && !games && (
         <PanelSection>
           <PanelSectionRow>
@@ -508,13 +465,51 @@ const HoardContent: FC = () => {
         </PanelSection>
       )}
 
-      {/* 2. Categorized Game List */}
       {games && (
         <>
-          {/* Section 1: Ready to track */}
-          <PanelSection
-            title={`${t.readySection} (${games.summary.ready_count})`}
-          >
+          {/* Section 1: Tracked Games */}
+          <PanelSection title={`${t.trackedSection} (${games.summary.tracked_count})`}>
+            {games.tracked.length === 0 ? (
+              <PanelSectionRow>
+                <div style={{ fontSize: "12px", color: "#888", fontStyle: "italic", padding: "4px 0" }}>
+                  {t.emptyCategory}
+                </div>
+              </PanelSectionRow>
+            ) : (
+              games.tracked.map((game) => {
+                const isBusy = busyGame === game.slug;
+                const verLabel = game.last_version_num ? `v${game.last_version_num}` : "SYNCED";
+                return (
+                  <PanelSectionRow key={game.slug}>
+                    <ButtonItem
+                      layout="below"
+                      description={game.slug}
+                      onClick={() => handleUntrack(game)}
+                      disabled={isBusy || !game.save_id}
+                    >
+                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%", gap: "8px" }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: "8px", overflow: "hidden" }}>
+                          <FaCheckCircle style={{ color: "#2ecc71", fontSize: "13px", flexShrink: 0 }} />
+                          <span style={{ fontSize: "13px", fontWeight: "500", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                            {game.name}
+                          </span>
+                        </div>
+                        <div style={{ display: "flex", alignItems: "center", gap: "6px", flexShrink: 0 }}>
+                          <Badge color={game.paused ? "amber" : "green"}>
+                            {game.paused ? "PAUSED" : verLabel}
+                          </Badge>
+                          {isBusy ? <Spinner /> : game.save_id ? <FaTimes style={{ color: "#888", fontSize: "11px" }} /> : null}
+                        </div>
+                      </div>
+                    </ButtonItem>
+                  </PanelSectionRow>
+                );
+              })
+            )}
+          </PanelSection>
+
+          {/* Section 2: Ready to track */}
+          <PanelSection title={`${t.readySection} (${games.summary.ready_count})`}>
             {games.ready_to_track.length === 0 ? (
               <PanelSectionRow>
                 <div style={{ fontSize: "12px", color: "#888", fontStyle: "italic", padding: "4px 0" }}>
@@ -523,20 +518,20 @@ const HoardContent: FC = () => {
               </PanelSectionRow>
             ) : (
               games.ready_to_track.map((game) => {
-                const isItemTracking = trackingGame === (game.slug || game.name);
+                const isBusy = busyGame === game.slug;
                 return (
-                  <PanelSectionRow key={game.slug || game.name}>
+                  <PanelSectionRow key={game.slug}>
                     <ButtonItem
                       layout="below"
-                      description={game.slug ? `slug: ${game.slug}` : undefined}
+                      description={game.slug}
                       onClick={() => handleTrack(game)}
-                      disabled={isItemTracking}
+                      disabled={isBusy}
                     >
                       <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%", gap: "8px" }}>
                         <span style={{ fontSize: "13px", fontWeight: "500", overflow: "hidden", textOverflow: "ellipsis" }}>
                           {game.name}
                         </span>
-                        {isItemTracking ? <Spinner /> : <FaPlus style={{ color: "#3498db", flexShrink: 0 }} />}
+                        {isBusy ? <Spinner /> : <FaPlus style={{ color: "#3498db", flexShrink: 0 }} />}
                       </div>
                     </ButtonItem>
                   </PanelSectionRow>
@@ -545,158 +540,69 @@ const HoardContent: FC = () => {
             )}
           </PanelSection>
 
-          {/* Section 2: Other Steam Games */}
-          <PanelSection
-            title={`${t.otherSection} (${games.summary.other_count})`}
-          >
-            {games.other_games.length === 0 ? (
+          {/* Section 3: Missing save folder (collapsed by default) */}
+          {games.summary.missing_count > 0 && (
+            <PanelSection title={`${t.missingFolderSection} (${games.summary.missing_count})`}>
               <PanelSectionRow>
-                <div style={{ fontSize: "12px", color: "#888", fontStyle: "italic", padding: "4px 0" }}>
-                  {t.emptyCategory}
-                </div>
-              </PanelSectionRow>
-            ) : (
-              games.other_games.map((game) => {
-                const isItemTracking = trackingGame === game.name;
-                return (
-                  <PanelSectionRow key={game.appid || game.name}>
-                    <ButtonItem
-                      layout="below"
-                      description={game.appid ? `AppID: ${game.appid}` : undefined}
-                      onClick={() => handleTrack(game)}
-                      disabled={isItemTracking}
-                    >
-                      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", width: "100%", gap: "8px" }}>
-                        <span style={{ fontSize: "13px", fontWeight: "500", overflow: "hidden", textOverflow: "ellipsis" }}>
-                          {game.name}
-                        </span>
-                        {isItemTracking ? <Spinner /> : <FaPlus style={{ color: "#bdc3c7", flexShrink: 0 }} />}
-                      </div>
-                    </ButtonItem>
-                  </PanelSectionRow>
-                );
-              })
-            )}
-          </PanelSection>
-
-          {/* Section 3: Tracked Games */}
-          <PanelSection
-            title={`${t.trackedSection} (${games.summary.tracked_count})`}
-          >
-            {games.tracked.length === 0 ? (
-              <PanelSectionRow>
-                <div style={{ fontSize: "12px", color: "#888", fontStyle: "italic", padding: "4px 0" }}>
-                  {t.emptyCategory}
-                </div>
-              </PanelSectionRow>
-            ) : (
-              games.tracked.map((game) => (
-                <PanelSectionRow key={game.slug || game.name}>
-                  <Focusable
-                    onActivate={() => {}}
-                    style={{
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "space-between",
-                      width: "100%",
-                      padding: "6px 8px",
-                      borderRadius: "4px",
-                      backgroundColor: "rgba(255, 255, 255, 0.04)",
-                    }}
-                  >
-                    <div style={{ display: "flex", alignItems: "center", gap: "8px", overflow: "hidden" }}>
-                      <FaCheckCircle style={{ color: "#2ecc71", fontSize: "14px", flexShrink: 0 }} />
-                      <span
-                        style={{
-                          fontSize: "13px",
-                          fontWeight: "500",
-                          textOverflow: "ellipsis",
-                          whiteSpace: "nowrap",
-                          overflow: "hidden",
-                        }}
-                      >
-                        {game.name}
-                      </span>
-                    </div>
-                    <Badge color="green">SYNCED</Badge>
-                  </Focusable>
-                </PanelSectionRow>
-              ))
-            )}
-          </PanelSection>
-
-          {/* Section 4: Missing save folder (collapsed by default) */}
-          <PanelSection
-            title={`${t.missingFolderSection} (${games.summary.missing_count})`}
-          >
-            <PanelSectionRow>
-              <ButtonItem
-                layout="below"
-                onClick={() => setShowMissingFolder((prev) => !prev)}
-              >
-                <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "8px" }}>
-                  {showMissingFolder ? <FaChevronDown /> : <FaChevronRight />}
-                  <span>{showMissingFolder ? t.collapse : t.expand} ({games.summary.missing_count})</span>
-                </div>
-              </ButtonItem>
-            </PanelSectionRow>
-
-            {showMissingFolder && (
-              <>
-                <PanelSectionRow>
-                  <div style={{ fontSize: "11px", color: "#888", marginBottom: "6px" }}>
-                    {t.missingFolderDesc}
+                <ButtonItem layout="below" onClick={() => setShowMissingFolder((prev) => !prev)}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: "8px" }}>
+                    {showMissingFolder ? <FaChevronDown /> : <FaChevronRight />}
+                    <span>{showMissingFolder ? t.collapse : t.expand} ({games.summary.missing_count})</span>
                   </div>
-                </PanelSectionRow>
-                {games.missing_folder.map((game) => (
-                  <PanelSectionRow key={game.slug || game.name}>
-                    <Focusable
-                      onActivate={() => {}}
-                      style={{
-                        display: "flex",
-                        alignItems: "center",
-                        gap: "8px",
-                        width: "100%",
-                        padding: "6px 8px",
-                        borderRadius: "4px",
-                        opacity: 0.6,
-                        backgroundColor: "rgba(0, 0, 0, 0.15)",
-                      }}
-                    >
-                      <FaFolderMinus style={{ color: "#f39c12", fontSize: "14px", flexShrink: 0 }} />
-                      <span
+                </ButtonItem>
+              </PanelSectionRow>
+
+              {showMissingFolder && (
+                <>
+                  <PanelSectionRow>
+                    <div style={{ fontSize: "11px", color: "#888", marginBottom: "6px" }}>
+                      {t.missingFolderDesc}
+                    </div>
+                  </PanelSectionRow>
+                  {games.missing_folder.map((game) => (
+                    <PanelSectionRow key={game.slug}>
+                      <Focusable
+                        onActivate={() => {}}
                         style={{
-                          fontSize: "12px",
-                          textOverflow: "ellipsis",
-                          whiteSpace: "nowrap",
-                          overflow: "hidden",
+                          display: "flex",
+                          alignItems: "center",
+                          gap: "8px",
+                          width: "100%",
+                          padding: "6px 8px",
+                          borderRadius: "4px",
+                          opacity: 0.6,
+                          backgroundColor: "rgba(0, 0, 0, 0.15)",
                         }}
                       >
-                        {game.name}
-                      </span>
-                    </Focusable>
-                  </PanelSectionRow>
-                ))}
-              </>
-            )}
-          </PanelSection>
+                        <FaFolderMinus style={{ color: "#f39c12", fontSize: "14px", flexShrink: 0 }} />
+                        <span
+                          style={{
+                            fontSize: "12px",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                            overflow: "hidden",
+                          }}
+                        >
+                          {game.name}
+                        </span>
+                      </Focusable>
+                    </PanelSectionRow>
+                  ))}
+                </>
+              )}
+            </PanelSection>
+          )}
         </>
       )}
     </>
   );
 };
 
-// ==========================================
-// Plugin Definition
-// ==========================================
-
 export default definePlugin(() => {
   return {
     name: "Hoard Sync",
     icon: <FaCloudUploadAlt />,
     content: <HoardContent />,
-    onDismount() {
-      // Cleanup hook if needed
-    },
+    onDismount() {},
   };
 });
